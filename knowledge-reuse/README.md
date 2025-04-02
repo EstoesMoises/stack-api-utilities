@@ -48,7 +48,8 @@ This ensures each export creates a unique file that won't overwrite previous exp
 | `up_vote_count`           | integer  | The number of upvotes the question received (score in v3 API). |
 | `creation_date`           | datetime | The date and time when the question was created. |
 | `question_id`             | integer  | Unique identifier of the question. |
-| `share_link`              | string   | URL to the question on Stack Overflow. |
+| `share_link`              | string   | Shortened URL to the question on Stack Overflow. |
+| `link`                    | string   | URL to the question on Stack Overflow. |
 | `title`                   | string   | Title of the question. |
 | `is_SME`                  | boolean  | Whether the answer owner is considered a Subject Matter Expert (SME) of any of the tags involved. |
 | `status`                  | string   | Indicates if the question is closed/obsolete/N/A. |
