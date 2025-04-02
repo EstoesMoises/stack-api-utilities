@@ -4,7 +4,7 @@ import csv
 import time
 import itertools
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import urlparse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
@@ -22,11 +22,38 @@ def forceAPIV3(user_input_url):
     base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
     return f"{base_url}/api/v3"
 
+def get_date_range(time_filter):
+    """Generate from/to dates based on the selected time filter"""
+    today = datetime.now()
+    
+    if time_filter == "month":
+        # Last month
+        from_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+    elif time_filter == "quarter":
+        # Last quarter (90 days)
+        from_date = (today - timedelta(days=90)).strftime("%Y-%m-%d")
+    elif time_filter == "year":
+        # Last year
+        from_date = (today - timedelta(days=365)).strftime("%Y-%m-%d")
+    elif time_filter == "custom":
+        # Custom range will be handled via explicit from_date/to_date parameters
+        return None, None
+    else:
+        # No filter - return None to indicate no date filtering
+        return None, None
+        
+    to_date = today.strftime("%Y-%m-%d")
+    return from_date, to_date
+
 parser = argparse.ArgumentParser(description="Export questions from Stack Overflow Enterprise API to CSV.")
 parser.add_argument("--base-url", required=True, help="Stack Overflow Enterprise Base URL (e.g., https://your-instance.stackoverflow.com)")
 parser.add_argument("--token", required=True, help="Access token for authentication")
 parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
 parser.add_argument("--threads", "-t", type=int, default=10, help="Number of concurrent threads for API calls")
+parser.add_argument("--filter", choices=["month", "quarter", "year", "custom"], default="quarter", 
+                    help="Time filter for questions (last month, last quarter, last year or custom dates)")
+parser.add_argument("--from-date", help="Start date for custom filter (format: YYYY-MM-DD)")
+parser.add_argument("--to-date", help="End date for custom filter (format: YYYY-MM-DD)")
 args = parser.parse_args()
 
 BASE_URL = forceAPIV3(args.base_url)
@@ -34,6 +61,17 @@ ACCESS_TOKEN = args.token
 HEADERS = { "Authorization": f"Bearer {ACCESS_TOKEN}"}
 VERBOSE = args.verbose
 MAX_THREADS = args.threads
+
+# Get date range based on filter
+if args.filter == "custom" and (not args.from_date or not args.to_date):
+    print("Error: --from-date and --to-date are required when using --filter=custom")
+    exit(1)
+
+if args.filter == "custom":
+    FROM_DATE = args.from_date
+    TO_DATE = args.to_date
+else:
+    FROM_DATE, TO_DATE = get_date_range(args.filter)
 
 # Cache for SME data to avoid redundant API calls
 TAG_SME_CACHE = {}
@@ -52,10 +90,18 @@ def get_questions():
     page = 1
     total_pages = None
     
-    log(f"Starting to fetch questions from {BASE_URL}")
+    filter_message = ""
+    if FROM_DATE and TO_DATE:
+        filter_message = f" with date filter from {FROM_DATE} to {TO_DATE}"
+    
+    log(f"Starting to fetch questions from {BASE_URL}{filter_message}")
     
     while True:
+        # Build the URL with optional date filtering
         url = f"{BASE_URL}/questions?page={page}&pageSize=100"
+        if FROM_DATE and TO_DATE:
+            url += f"&from={FROM_DATE}&to={TO_DATE}"
+            
         log(f"Fetching page {page}/{total_pages or '?'} of questions")
         
         try:
@@ -473,6 +519,7 @@ def export_to_csv():
     API_V2_CALLS = 0
     
     start_time = datetime.now()
+    
     timestamp = start_time.strftime("%Y%m%d_%H%M%S")
     log(f"Export process started at {start_time}")
     
@@ -498,7 +545,12 @@ def export_to_csv():
     # This now includes preloading accepted answers
     preload_user_data(questions)
     
-    csv_filename = f"knowledge_reuse_export_{timestamp}.csv"
+    # Create filename with from and to dates
+    date_part = ""
+    if FROM_DATE and TO_DATE:
+        date_part = f"_{FROM_DATE}_to_{TO_DATE}"
+        
+    csv_filename = f"knowledge_reuse_export{date_part}.csv"
     log(f"Writing {len(questions)} questions to {csv_filename}")
     
     stop_event = threading.Event()
@@ -610,8 +662,20 @@ def export_to_csv():
     end_time = datetime.now()
     duration = end_time - start_time
     log(f"Export process completed at {end_time}. Total duration: {duration}")
+    
+    # Print a summary of the export with date filter info
+    date_filter_str = ""
+    if args.filter == "month":
+        date_filter_str = f" for the last month (from {FROM_DATE} to {TO_DATE})"
+    elif args.filter == "quarter":
+        date_filter_str = f" for the last quarter (from {FROM_DATE} to {TO_DATE})"
+    elif args.filter == "year":
+        date_filter_str = f" for the last year (from {FROM_DATE} to {TO_DATE})"
+    elif args.filter == "custom":
+        date_filter_str = f" for custom date range (from {FROM_DATE} to {TO_DATE})"
+    
     print(f"\n✅ Export complete! Data saved to: {csv_filename}")
-    print(f"   Total questions processed: {len(questions)}")
+    print(f"   Total questions processed{date_filter_str}: {len(questions)}")
     print(f"   Total time: {duration}")
     print(f"   Total SME API calls: {len(TAG_SME_CACHE)}")
     print(f"   Total user data API calls: {len(USER_DATA_CACHE)}")

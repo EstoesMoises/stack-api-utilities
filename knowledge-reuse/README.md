@@ -16,30 +16,32 @@ python knowledge-reuse-export.py --base-url "https://[your-site].stackenterprise
 - `--token`: Access token for authentication
 
 ### Optional Arguments:
+- `--filter`: you can choose between `month`, `quarter`, `year` or `custom` to get information about the question for that give time period to date (defaults to the last `quarter`).
+- `--from-date`: If you chose `custom` as the filter, provide the start date in `YYYY-MM-DD` format.
+- `--to-date`: If you chose `custom` as the filter, provide the end date in `YYYY-MM-DD` format.
 - `--verbose` or `-v`: Enable detailed logging output for troubleshooting
-- `--threads` or `-t`: Number of concurrent threads for API calls (default: 10)
+- `--threads` or `-t`: Number of concurrent threads for API calls (default: 10) (using too many threads might result in errors due to throttling)
 
 ## **Example Usage**
 
 ```bash
-python knowledge-reuse-export.py --base-url "https://[your-site].stackenterprise.co" --token "abc123xyz" -v -t 20
+python knowledge-reuse-export.py --base-url "https://[your-site].stackenterprise.co" --token "abc123xyz" -v -t 20 --filter "quarter"
 ```
 
 # **Output Files**
 
 The script generates a timestamped CSV file with the naming convention:
 ```
-knowledge_reuse_export_YYYYMMDD_HHMMSS.csv
+knowledge_reuse_export_{YYYY-MM-DD}_to_{YYYY-MM-DD}.csv
 ```
 
-This ensures each export creates a unique file that won't overwrite previous exports.
 
 # **Exported CSV Fields**
 
 ## **Question Data**
 | Field                     | Type     | Description |
 |---------------------------|----------|-------------|
-| `tags`                    | array    | List of tags associated with the question. |
+| `tags`                    | string   | Comma-separated string of tags associated with the question. |
 | `owner.id`                | integer  | The user ID of the question owner. |
 | `owner.user_type`         | string   | Type of user (e.g., registered, moderator, etc.). |
 | `owner.display_name`      | string   | Display name of the question owner. |
