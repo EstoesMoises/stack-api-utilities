@@ -334,7 +334,8 @@ def preload_user_data(questions):
     # Add question owners
     for question in questions:
         owner = question.get("owner", {})
-        user_id = owner.get("id")
+        if owner:
+            user_id = owner.get("id")
         if user_id:
             user_ids.add(user_id)
     
@@ -483,7 +484,7 @@ def export_to_csv():
                         progress_percent = int((i / total_questions) * 100)
                         loading_message = f"Writing data to {csv_filename}... {progress_percent}% complete"
                 
-                owner = question.get("owner", {})
+                owner = question.get("owner", {}) or {}
                 owner_id = owner.get("id")
                 
                 # Get owner user data (department, job title)
@@ -524,7 +525,7 @@ def export_to_csv():
                 ]
                 
                 if accepted_answer:
-                    answer_owner = accepted_answer.get("owner", {})
+                    answer_owner = accepted_answer.get("owner", {}) or {}
                     answer_owner_id = answer_owner.get("id")
                     
                     # Get answer owner user data (department, job title)
