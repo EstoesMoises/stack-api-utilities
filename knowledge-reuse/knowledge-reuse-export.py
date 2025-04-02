@@ -39,6 +39,7 @@ MAX_THREADS = args.threads
 TAG_SME_CACHE = {}
 USER_SME_CACHE = defaultdict(set)
 USER_DATA_CACHE = {}  # Cache for user data (department, jobTitle)
+ANSWER_CACHE = {}  # Cache for accepted answers
 
 def log(message):
     """Print log message if verbose mode is enabled"""
@@ -84,6 +85,11 @@ def get_questions():
     return questions
 
 def get_accepted_answer(question_id):
+    # Check cache first
+    if question_id in ANSWER_CACHE:
+        log(f"Using cached answer for question ID: {question_id}")
+        return ANSWER_CACHE[question_id]
+        
     url = f"{BASE_URL}/questions/{question_id}/answers"
     log(f"Fetching answers for question ID: {question_id}")
     
@@ -97,14 +103,64 @@ def get_accepted_answer(question_id):
         for answer in answers:
             if answer.get("isAccepted", False):
                 log(f"Found accepted answer ID: {answer.get('id')} for question ID: {question_id}")
+                # Store in cache
+                ANSWER_CACHE[question_id] = answer
                 return answer
         
         log(f"No accepted answer found for question ID: {question_id}")
+        # Cache negative result too
+        ANSWER_CACHE[question_id] = None
         return None
         
     except requests.exceptions.RequestException as e:
         log(f"Error fetching answers for question {question_id}: {str(e)}")
-        raise
+        ANSWER_CACHE[question_id] = None  # Cache the error case
+        return None
+
+def preload_answers(questions):
+    """Preload accepted answers for answered questions in parallel"""
+    log("Preloading accepted answers for answered questions...")
+    
+    # Collect all question IDs that are marked as answered
+    answered_questions = [q.get("id") for q in questions if q.get("isAnswered")]
+    total_answered = len(answered_questions)
+    
+    log(f"Found {total_answered} answered questions to preload")
+    
+    stop_event = threading.Event()
+    loading_message = f"Preloading accepted answers for {total_answered} questions..."
+    loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
+    
+    if not VERBOSE:
+        loading_thread.start()
+    
+    try:
+        with ThreadPoolExecutor(max_workers=MAX_THREADS) as executor:
+            # Submit all question API calls to the thread pool
+            futures = {executor.submit(get_accepted_answer, qid): qid for qid in answered_questions}
+            
+            # Process results as they complete
+            completed = 0
+            for future in futures:
+                try:
+                    answer = future.result()  # This ensures any exceptions are raised
+                    qid = futures[future]
+                    ANSWER_CACHE[qid] = answer  # Store in cache (even if None)
+                    completed += 1
+                    if VERBOSE and completed % 50 == 0:
+                        log(f"Preloaded {completed}/{total_answered} answers")
+                except Exception as e:
+                    qid = futures[future]
+                    log(f"Error preloading answer for question {qid}: {str(e)}")
+                    ANSWER_CACHE[qid] = None  # Cache the error case
+            
+        log(f"Preloaded {len(ANSWER_CACHE)} accepted answers")
+        
+    finally:
+        stop_event.set()
+        if not VERBOSE:
+            loading_thread.join()
+            print("\rAccepted answer preloading complete!        ")
 
 def calculate_user_tenure(joined_date, last_seen_date):
     if joined_date and last_seen_date:
@@ -336,35 +392,23 @@ def preload_user_data(questions):
         owner = question.get("owner", {})
         if owner:
             user_id = owner.get("id")
-        if user_id:
-            user_ids.add(user_id)
+            if user_id:
+                user_ids.add(user_id)
     
-    # Add answer owners (fetch answers for each question)
-    total_questions = len(questions)
-    stop_event = threading.Event()
-    loading_message = "Collecting user IDs from answers..."
-    loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
+    # Add answer owners - we'll do this after preloading answers for better efficiency
     
-    if not VERBOSE:
-        loading_thread.start()
+    # First, preload answers for all questions
+    preload_answers(questions)
     
-    try:
-        for i, question in enumerate(questions, 1):
-            if question.get("isAnswered"):
-                answer = get_accepted_answer(question.get("id"))
-                if answer:
-                    answer_owner = answer.get("owner", {})
-                    user_id = answer_owner.get("id")
-                    if user_id:
-                        user_ids.add(user_id)
-            
-            if i % 50 == 0 or i == total_questions:
-                log(f"Collected user IDs from {i}/{total_questions} questions")
-    finally:
-        stop_event.set()
-        if not VERBOSE:
-            loading_thread.join()
-            print("\rUser ID collection complete!        ")
+    # Now collect answer owner IDs from the preloaded cache
+    for question in questions:
+        if question.get("isAnswered"):
+            qid = question.get("id")
+            if qid in ANSWER_CACHE and ANSWER_CACHE[qid]:
+                answer_owner = ANSWER_CACHE[qid].get("owner", {})
+                user_id = answer_owner.get("id")
+                if user_id:
+                    user_ids.add(user_id)
     
     log(f"Found {len(user_ids)} unique users")
     
@@ -451,6 +495,7 @@ def export_to_csv():
     preload_sme_data(questions)
     
     # Preload user data (department, job title) to improve performance
+    # This now includes preloading accepted answers
     preload_user_data(questions)
     
     csv_filename = f"knowledge_reuse_export_{timestamp}.csv"
@@ -468,7 +513,7 @@ def export_to_csv():
             writer = csv.writer(f)
             writer.writerow([
                 "tags", "owner.account_id", "owner.user_type", "owner.display_name", "is_answered",
-                "view_count", "up_vote_count", "creation_date", "question_id", "share_link", "title",
+                "view_count", "up_vote_count", "creation_date", "question_id", "share_link", "link", "title",
                 "is_SME", "status", "department", "job_title", "user_tenure",
                 "acc_answer_owner_id", "acc_answer_user_type", "acc_answer_display_name", 
                 "acc_answer_up_vote_count", "acc_answer_creation_date", "acc_answer_id",
@@ -492,10 +537,11 @@ def export_to_csv():
                 if owner_id:
                     owner_data = get_user_data(owner_id)
                 
-                # Get accepted answer if question is answered
+                # Get accepted answer if question is answered (from cache)
                 accepted_answer = None
                 if question.get("isAnswered"):
-                    accepted_answer = get_accepted_answer(question.get("id"))
+                    qid = question.get("id")
+                    accepted_answer = ANSWER_CACHE.get(qid)
                 
                 tags = question.get("tags", [])
                 tag_names = [tag["name"] for tag in tags if "name" in tag]
@@ -516,6 +562,7 @@ def export_to_csv():
                     question.get("creationDate"),
                     question.get("id"),
                     question.get("shareUrl"),
+                    question.get("webUrl"),
                     question.get("title"),
                     is_owner_sme,
                     "Closed" if question.get("isClosed") else "Obsolete" if question.get("isObsolete") else "N/A",
@@ -568,6 +615,7 @@ def export_to_csv():
     print(f"   Total time: {duration}")
     print(f"   Total SME API calls: {len(TAG_SME_CACHE)}")
     print(f"   Total user data API calls: {len(USER_DATA_CACHE)}")
+    print(f"   Total cached answers: {len(ANSWER_CACHE)}")
     print(f"   Additional API v2.3 calls: {API_V2_CALLS}")
         
 if __name__ == "__main__":

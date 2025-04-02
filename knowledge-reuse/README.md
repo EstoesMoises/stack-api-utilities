@@ -8,7 +8,7 @@
 ## **Command Line Arguments**
 
 ```bash
-python knowledge-reuse-export.py --base-url "https://[your-site].stackenterprise.co --token "your-api-token" [options]
+python knowledge-reuse-export.py --base-url "https://[your-site].stackenterprise.co" --token "your-api-token" [options]
 ```
 
 ### Required Arguments:
