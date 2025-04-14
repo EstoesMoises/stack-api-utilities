@@ -54,7 +54,7 @@ knowledge_reuse_export_{YYYY-MM-DD}_to_{YYYY-MM-DD}.csv
 | `link`                    | string   | URL to the question on Stack Overflow. |
 | `title`                   | string   | Title of the question. |
 | `is_SME`                  | boolean  | Whether the answer owner is considered a Subject Matter Expert (SME) of any of the tags involved. |
-| `status`                  | string   | Indicates if the question is closed/obsolete/N/A. |
+| `status`                  | string   | Indicates if the question is Closed/Obsolete/Deleted/Open. |
 | `department`              | string   | Department of the question owner (if applicable). |
 | `job_title`               | string   | Job title of the question owner. |
 | `user_tenure`             | integer  | Time since the user joined, calculated as `joined_date - last_seen_date`. |
@@ -62,18 +62,18 @@ knowledge_reuse_export_{YYYY-MM-DD}_to_{YYYY-MM-DD}.csv
 ## **Accepted Answer Data**
 | Field                     | Type     | Description |
 |---------------------------|----------|-------------|
-| `answer.owner_id`         | integer  | User ID of the answer owner. |
-| `answer.user_type`        | string   | Type of user who posted the answer. |
-| `answer.display_name`     | string   | Display name of the answer owner. |
-| `answer.up_vote_count`    | integer  | Number of upvotes the accepted answer received. |
-| `answer.is_accepted`      | boolean  | Whether the answer is the accepted answer (always True). |
-| `answer.creation_date`    | datetime | Date and time when the answer was created. |
-| `answer.answer_id`        | integer  | Unique identifier of the answer. |
-| `answer.question_id`      | integer  | ID of the related question. |
-| `answer.is_SME`           | boolean  | Whether the answer owner is considered a Subject Matter Expert of any of the tags involved. |
-| `answer.department`       | string   | Department of the answer owner (if applicable). |
-| `answer.job_title`        | string   | Job title of the answer owner. |
-| `answer.user_tenure`      | integer  | Time since the user joined, calculated as `joined_date - last_seen_date`. |
+| `acc_answer.owner_id`         | integer  | User ID of the answer owner. |
+| `acc_answer.user_type`        | string   | Type of user who posted the answer. |
+| `acc_answer.display_name`     | string   | Display name of the answer owner. |
+| `acc_answer.up_vote_count`    | integer  | Number of upvotes the accepted answer received. |
+| `acc_answer.is_accepted`      | boolean  | Whether the answer is the accepted answer (always True). |
+| `acc_answer.creation_date`    | datetime | Date and time when the answer was created. |
+| `acc_answer.answer_id`        | integer  | Unique identifier of the answer. |
+| `acc_answer.question_id`      | integer  | ID of the related question. |
+| `acc_answer.is_SME`           | boolean  | Whether the answer owner is considered a Subject Matter Expert of any of the tags involved. |
+| `acc_answer.department`       | string   | Department of the answer owner (if applicable). |
+| `acc_answer.job_title`        | string   | Job title of the answer owner. |
+| `acc_answer.user_tenure`      | integer  | Time since the user joined, calculated as `joined_date - last_seen_date`. |
 
 ## **Notes**
 - The `is_SME` field is determined if the user in question is an SME of any of tags that have been added to the question.

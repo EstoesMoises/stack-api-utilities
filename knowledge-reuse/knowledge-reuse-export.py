@@ -564,7 +564,7 @@ def export_to_csv():
         with open(csv_filename, mode="w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow([
-                "tags", "owner.account_id", "owner.user_type", "owner.display_name", "is_answered",
+                "tags", "owner.account_id", "owner.user_type", "owner.display_name", "is_answered", "has_accepted",
                 "view_count", "up_vote_count", "creation_date", "question_id", "share_link", "link", "title",
                 "is_SME", "status", "department", "job_title", "user_tenure",
                 "acc_answer_owner_id", "acc_answer_user_type", "acc_answer_display_name", 
@@ -609,6 +609,7 @@ def export_to_csv():
                     owner.get("role"),
                     owner.get("name"),
                     question.get("isAnswered"),
+                    "TRUE" if accepted_answer else "FALSE", 
                     question.get("viewCount"),
                     question.get("score"),
                     question.get("creationDate"),
@@ -617,7 +618,7 @@ def export_to_csv():
                     question.get("webUrl"),
                     question.get("title"),
                     is_owner_sme,
-                    "Closed" if question.get("isClosed") else "Obsolete" if question.get("isObsolete") else "N/A",
+                    "Closed" if question.get("isClosed") else "Obsolete" if question.get("isObsolete") else "Deleted" if question.get("isDeleted") else "Open",
                     owner_data.get("department"),
                     owner_data.get("jobTitle"),
                     owner_data.get("tenure")
