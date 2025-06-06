@@ -1,5 +1,6 @@
 import argparse
-import requests
+import aiohttp
+import asyncio
 import json
 import time
 import itertools
@@ -7,21 +8,28 @@ import threading
 import schedule
 import signal
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 import logging
 from typing import Dict, List, Optional
+from collections import defaultdict
+import statistics
 
 # Global counters and caches
 API_V2_CALLS = 0
 API_V3_CALLS = 0
 USER_CACHE = {}
 USER_DETAILS_CACHE = {}
+SME_CACHE = {}
+ACCEPTED_ANSWERS_CACHE = {}
 
 # Rate limiting configuration according to Teams API v3 Docs.
 RATE_LIMIT_REQUESTS = 45  # Stay under 50 to be safe
 RATE_LIMIT_WINDOW = 2.0   # 2 seconds
 RATE_LIMIT_RETRY_DELAY = 3.0  # Wait 3 seconds on 429 error
+
+# Async semaphore for rate limiting
+RATE_LIMITER = None
 
 # Global configuration
 CONFIG = {}
@@ -65,6 +73,20 @@ def get_api_v2_url(base_url: str) -> str:
     parsed_url = urlparse(base_url.strip())
     return f"{parsed_url.scheme}://{parsed_url.netloc}/api/2.3"
 
+def convert_epoch_to_utc_timestamp(epoch_timestamp):
+    """Convert epoch timestamp to UTC timestamp format like 2024-01-03T17:21:01.323"""
+    if not epoch_timestamp:
+        return None
+    
+    try:
+        # Convert epoch to datetime in UTC
+        dt = datetime.fromtimestamp(epoch_timestamp, tz=timezone.utc)
+        # Format as requested: YYYY-MM-DDTHH:MM:SS.mmm
+        return dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]  # Remove last 3 digits from microseconds to get milliseconds
+    except (ValueError, TypeError, OSError) as e:
+        log(f"Error converting epoch timestamp {epoch_timestamp}: {str(e)}")
+        return None
+
 def log(message: str):
     """Log message if verbose mode is enabled"""
     if VERBOSE:
@@ -72,37 +94,43 @@ def log(message: str):
     else:
         logger.info(message)
 
-def make_api_request(url: str, headers: Dict[str, str], params: Dict = None) -> Optional[Dict]:
-    """Make API request with simple rate limiting and retry logic"""
-    global API_V3_CALLS
+async def make_api_request(session: aiohttp.ClientSession, url: str, params: Dict = None) -> Optional[Dict]:
+    """Make async API request with rate limiting and retry logic"""
+    global API_V3_CALLS, RATE_LIMITER
     
     max_retries = 3
     retry_count = 0
     
     while retry_count < max_retries:
         try:
-            # Simple delay to avoid overwhelming the API
-            time.sleep(0.1)  # 100ms between requests
-            
-            API_V3_CALLS += 1
-            response = requests.get(url, headers=headers, params=params, timeout=30)
-            
-            if response.status_code == 429:
-                # Rate limited - wait and retry
-                retry_after = response.headers.get('Retry-After', RATE_LIMIT_RETRY_DELAY)
-                wait_time = float(retry_after)
-                log(f"Rate limited (429), waiting {wait_time} seconds before retry {retry_count + 1}/{max_retries}")
-                time.sleep(wait_time)
-                retry_count += 1
-                continue
-            
-            response.raise_for_status()
-            return response.json()
-            
-        except requests.exceptions.RequestException as e:
+            # Use semaphore for rate limiting
+            async with RATE_LIMITER:
+                API_V3_CALLS += 1
+                
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    if response.status == 429:
+                        # Rate limited - wait and retry
+                        retry_after = response.headers.get('Retry-After', str(RATE_LIMIT_RETRY_DELAY))
+                        wait_time = float(retry_after)
+                        log(f"Rate limited (429), waiting {wait_time} seconds before retry {retry_count + 1}/{max_retries}")
+                        await asyncio.sleep(wait_time)
+                        retry_count += 1
+                        continue
+                    
+                    if response.status != 200:
+                        log(f"API request failed with status {response.status} for {url}")
+                        return None
+                    
+                    return await response.json()
+                    
+        except asyncio.TimeoutError:
+            log(f"Request timeout for {url}, retry {retry_count + 1}/{max_retries}")
+            retry_count += 1
+            await asyncio.sleep(1)
+        except Exception as e:
             if "429" in str(e) or "rate limit" in str(e).lower():
                 log(f"Rate limit error: {str(e)}, waiting {RATE_LIMIT_RETRY_DELAY} seconds before retry {retry_count + 1}/{max_retries}")
-                time.sleep(RATE_LIMIT_RETRY_DELAY)
+                await asyncio.sleep(RATE_LIMIT_RETRY_DELAY)
                 retry_count += 1
                 continue
             else:
@@ -112,36 +140,41 @@ def make_api_request(url: str, headers: Dict[str, str], params: Dict = None) -> 
     log(f"Max retries exceeded for {url}")
     return None
 
-def make_api_v2_request(url: str, headers: Dict[str, str], params: Dict = None) -> Optional[Dict]:
-    """Make API v2.3 request with simple rate limiting"""
-    global API_V2_CALLS
+async def make_api_v2_request(session: aiohttp.ClientSession, url: str, params: Dict = None) -> Optional[Dict]:
+    """Make async API v2.3 request with rate limiting"""
+    global API_V2_CALLS, RATE_LIMITER
     
     max_retries = 3
     retry_count = 0
     
     while retry_count < max_retries:
         try:
-            # Simple delay to avoid overwhelming the API
-            time.sleep(0.1)  # 100ms between requests
-            
-            API_V2_CALLS += 1
-            response = requests.get(url, headers=headers, params=params, timeout=30)
-            
-            if response.status_code == 429:
-                retry_after = response.headers.get('Retry-After', RATE_LIMIT_RETRY_DELAY)
-                wait_time = float(retry_after)
-                log(f"Rate limited (429), waiting {wait_time} seconds before retry {retry_count + 1}/{max_retries}")
-                time.sleep(wait_time)
-                retry_count += 1
-                continue
-            
-            response.raise_for_status()
-            return response.json()
-            
-        except requests.exceptions.RequestException as e:
+            async with RATE_LIMITER:
+                API_V2_CALLS += 1
+                
+                async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=30)) as response:
+                    if response.status == 429:
+                        retry_after = response.headers.get('Retry-After', str(RATE_LIMIT_RETRY_DELAY))
+                        wait_time = float(retry_after)
+                        log(f"Rate limited (429), waiting {wait_time} seconds before retry {retry_count + 1}/{max_retries}")
+                        await asyncio.sleep(wait_time)
+                        retry_count += 1
+                        continue
+                    
+                    if response.status != 200:
+                        log(f"API v2 request failed with status {response.status} for {url}")
+                        return None
+                    
+                    return await response.json()
+                    
+        except asyncio.TimeoutError:
+            log(f"Request timeout for {url}, retry {retry_count + 1}/{max_retries}")
+            retry_count += 1
+            await asyncio.sleep(1)
+        except Exception as e:
             if "429" in str(e) or "rate limit" in str(e).lower():
                 log(f"Rate limit error: {str(e)}, waiting {RATE_LIMIT_RETRY_DELAY} seconds before retry {retry_count + 1}/{max_retries}")
-                time.sleep(RATE_LIMIT_RETRY_DELAY)
+                await asyncio.sleep(RATE_LIMIT_RETRY_DELAY)
                 retry_count += 1
                 continue
             else:
@@ -151,106 +184,137 @@ def make_api_v2_request(url: str, headers: Dict[str, str], params: Dict = None) 
     log(f"Max retries exceeded for {url}")
     return None
 
-def get_all_users() -> List[Dict]:
-    """Fetch all users from the API"""
-    users = []
+async def get_paginated_data(session: aiohttp.ClientSession, endpoint: str, params: Dict = None) -> List[Dict]:
+    """Generic async function to get all paginated data from an endpoint"""
+    all_items = []
     page = 1
     total_pages = None
     
-    log("Starting to fetch all users")
+    log(f"Starting to fetch all data from {endpoint}")
     
     while True:
-        url = f"{CONFIG['base_url']}/users?page={page}&pageSize=100"
-        log(f"Fetching page {page}/{total_pages or '?'} of users")
+        current_params = params.copy() if params else {}
+        current_params.update({'page': page, 'pageSize': 100})
         
-        data = make_api_request(url, CONFIG['headers'])
+        url = f"{CONFIG['base_url']}/{endpoint}"
+        log(f"Fetching page {page}/{total_pages or '?'} from {endpoint}")
+        
+        data = await make_api_request(session, url, current_params)
         if not data:
             break
             
         items = data.get("items", [])
-        users.extend(items)
+        all_items.extend(items)
         
         if total_pages is None:
             total_pages = data.get("totalPages", 1)
             log(f"Total pages to fetch: {total_pages}")
         
-        log(f"Retrieved {len(items)} users from page {page}/{total_pages}")
+        log(f"Retrieved {len(items)} items from page {page}/{total_pages}")
         
         if page >= total_pages:
-            log(f"All pages fetched. Total users: {len(users)}")
+            log(f"All pages fetched. Total items: {len(all_items)}")
             break
         
         page += 1
         
-    return users
+    return all_items
 
-def get_all_questions() -> List[Dict]:
+async def get_accepted_answer_for_question(session: aiohttp.ClientSession, question_id: int) -> Optional[Dict]:
+    """Get the accepted answer for a specific question"""
+    url = f"{CONFIG['base_url']}/questions/{question_id}/answers"
+    
+    # Get first page to find accepted answer
+    data = await make_api_request(session, url, {'page': 1, 'pageSize': 100})
+    if not data or not data.get('items'):
+        return None
+    
+    # Find the accepted answer
+    for answer in data['items']:
+        if answer.get('isAccepted', False):
+            return {
+                'id': answer.get('id'),
+                'creationDate': answer.get('creationDate'),
+                'score': answer.get('score'),
+                'owner': answer.get('owner')
+            }
+    
+    # If not found in first page, check remaining pages
+    total_pages = data.get("totalPages", 1)
+    for page in range(2, total_pages + 1):
+        page_data = await make_api_request(session, url, {'page': page, 'pageSize': 100})
+        if not page_data or not page_data.get('items'):
+            continue
+            
+        for answer in page_data['items']:
+            if answer.get('isAccepted', False):
+                return {
+                    'id': answer.get('id'),
+                    'creationDate': answer.get('creationDate'),
+                    'score': answer.get('score'),
+                    'owner': answer.get('owner')
+                }
+    
+    return None
+
+async def get_accepted_answers_batch(session: aiohttp.ClientSession, questions_with_accepted: List[Dict]) -> Dict[int, Dict]:
+    """Get accepted answers for questions that have them, using async batch processing"""
+    accepted_answers = {}
+    
+    # Create semaphore for concurrent requests (respecting rate limits)
+    concurrent_limit = min(20, RATE_LIMIT_REQUESTS // 2)  # Conservative limit
+    semaphore = asyncio.Semaphore(concurrent_limit)
+    
+    async def fetch_accepted_answer(question):
+        async with semaphore:
+            question_id = question.get('id')
+            if not question_id:
+                return
+            
+            try:
+                accepted_answer = await get_accepted_answer_for_question(session, question_id)
+                if accepted_answer:
+                    accepted_answers[question_id] = accepted_answer
+                    log(f"Found accepted answer for question {question_id}")
+            except Exception as e:
+                log(f"Error fetching accepted answer for question {question_id}: {str(e)}")
+    
+    # Process in batches to avoid overwhelming the API
+    batch_size = 50
+    for i in range(0, len(questions_with_accepted), batch_size):
+        batch = questions_with_accepted[i:i + batch_size]
+        log(f"Processing accepted answers batch {i//batch_size + 1}/{(len(questions_with_accepted) + batch_size - 1)//batch_size}")
+        
+        tasks = [fetch_accepted_answer(question) for question in batch]
+        await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Small delay between batches
+        await asyncio.sleep(0.5)
+    
+    log(f"Retrieved {len(accepted_answers)} accepted answers")
+    return accepted_answers
+
+async def get_all_questions(session: aiohttp.ClientSession) -> List[Dict]:
     """Get all questions from the API"""
-    questions = []
-    page = 1
-    total_pages = None
-    
-    log("Starting to fetch all questions")
-    
-    while True:
-        url = f"{CONFIG['base_url']}/questions?page={page}&pageSize=100"
-        log(f"Fetching page {page}/{total_pages or '?'} of questions")
-        
-        data = make_api_request(url, CONFIG['headers'])
-        if not data:
-            break
-            
-        items = data.get("items", [])
-        questions.extend(items)
-        
-        if total_pages is None:
-            total_pages = data.get("totalPages", 1)
-            log(f"Total pages to fetch: {total_pages}")
-        
-        log(f"Retrieved {len(items)} questions from page {page}/{total_pages}")
-        
-        if page >= total_pages:
-            log(f"All pages fetched. Total questions: {len(questions)}")
-            break
-        
-        page += 1
-        
-    return questions
+    return await get_paginated_data(session, "questions")
 
-def get_all_articles() -> List[Dict]:
+async def get_unanswered_questions(session: aiohttp.ClientSession) -> List[Dict]:
+    """Get all unanswered questions from the API"""
+    return await get_paginated_data(session, "questions", {"isAnswered": "false"})
+
+async def get_questions_with_accepted_answers(session: aiohttp.ClientSession) -> List[Dict]:
+    """Get all questions with accepted answers from the API"""
+    return await get_paginated_data(session, "questions", {"hasAcceptedAnswer": "true"})
+
+async def get_all_users(session: aiohttp.ClientSession) -> List[Dict]:
+    """Fetch all users from the API"""
+    return await get_paginated_data(session, "users")
+
+async def get_all_articles(session: aiohttp.ClientSession) -> List[Dict]:
     """Get all articles from the API"""
-    articles = []
-    page = 1
-    total_pages = None
-    
-    log("Starting to fetch all articles")
-    
-    while True:
-        url = f"{CONFIG['base_url']}/articles?page={page}&pageSize=100"
-        log(f"Fetching page {page}/{total_pages or '?'} of articles")
-        
-        data = make_api_request(url, CONFIG['headers'])
-        if not data:
-            break
-            
-        items = data.get("items", [])
-        articles.extend(items)
-        
-        if total_pages is None:
-            total_pages = data.get("totalPages", 1)
-            log(f"Total pages to fetch: {total_pages}")
-        
-        log(f"Retrieved {len(items)} articles from page {page}/{total_pages}")
-        
-        if page >= total_pages:
-            log(f"All pages fetched. Total articles: {len(articles)}")
-            break
-        
-        page += 1
-        
-    return articles
+    return await get_paginated_data(session, "articles")
 
-def get_user_detailed_info_batch(user_ids: List[int], batch_size: int = 20) -> Dict[int, Dict]:
+async def get_user_detailed_info_batch(session: aiohttp.ClientSession, user_ids: List[int], batch_size: int = 20) -> Dict[int, Dict]:
     """Get detailed user information from API v2.3 in batches"""
     user_details = {}
     
@@ -270,7 +334,7 @@ def get_user_detailed_info_batch(user_ids: List[int], batch_size: int = 20) -> D
         v2_url = f"{CONFIG['api_v2_base']}/users/{ids_string}?order=desc&sort=reputation"
         log(f"Batch fetching detailed info for {len(batch)} users")
         
-        user_data = make_api_v2_request(v2_url, CONFIG['headers'])
+        user_data = await make_api_v2_request(session, v2_url)
         
         if user_data and 'items' in user_data:
             for user_item in user_data['items']:
@@ -279,6 +343,33 @@ def get_user_detailed_info_batch(user_ids: List[int], batch_size: int = 20) -> D
                     user_details[user_id] = user_item
                     
     return user_details
+
+async def get_sme_data_for_tags(session: aiohttp.ClientSession, tag_ids: List[int]) -> Dict[int, List[int]]:
+    """Get SME data for given tag IDs. Returns dict of tag_id -> list of user_ids"""
+    sme_data = {}
+    
+    # Process in batches to avoid overwhelming the API
+    batch_size = 10
+    for i in range(0, len(tag_ids), batch_size):
+        batch = tag_ids[i:i + batch_size]
+        tasks = []
+        
+        for tag_id in batch:
+            url = f"{CONFIG['base_url']}/tags/{tag_id}/subject-matter-experts"
+            tasks.append(make_api_request(session, url))
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for tag_id, result in zip(batch, results):
+            if isinstance(result, dict) and 'users' in result:
+                user_ids = [user.get('id') for user in result['users'] if user.get('id')]
+                sme_data[tag_id] = user_ids
+            else:
+                sme_data[tag_id] = []
+        
+        log(f"Processed SME data for batch {i//batch_size + 1}/{(len(tag_ids) + batch_size - 1)//batch_size}")
+    
+    return sme_data
 
 def calculate_account_longevity(creation_date: int) -> int:
     """Calculate account longevity in days"""
@@ -289,239 +380,388 @@ def calculate_account_longevity(creation_date: int) -> int:
     now = datetime.now()
     return (now - created).days
 
-def process_user_data(user: Dict, all_questions: List[Dict], all_articles: List[Dict], 
-                     user_details: Dict[int, Dict]) -> Dict:
-    """Process efficient user data for PowerBI"""
-    try:
-        # Add safety checks for None inputs
-        if user is None:
-            log(f"Error: user object is None")
-            return None
-            
-        if all_questions is None:
-            log(f"Error: all_questions is None")
-            return None
-            
-        if all_articles is None:
-            log(f"Error: all_articles is None")
-            return None
-            
-        if user_details is None:
-            log(f"Error: user_details is None")
-            return None
-        
+def get_user_sme_tags(user_id: int, all_sme_data: Dict[int, List[int]]) -> List[str]:
+    """Get list of tag names where user is an SME"""
+    sme_tag_names = []
+    
+    for tag_id, sme_user_ids in all_sme_data.items():
+        if user_id in sme_user_ids:
+            # Find the tag name from our tag cache or fetch it
+            tag_name = SME_CACHE.get(tag_id, f"tag_{tag_id}")
+            sme_tag_names.append(tag_name)
+    
+    return sme_tag_names
+
+def build_user_metrics(all_users: List[Dict], all_questions: List[Dict], 
+                      unanswered_questions: List[Dict], accepted_answer_questions: List[Dict],
+                      all_articles: List[Dict], user_details: Dict[int, Dict], 
+                      all_sme_data: Dict[int, List[int]]) -> Dict[int, Dict]:
+    """Build comprehensive user metrics for all users"""
+    user_metrics = {}
+    
+    # Group questions by owner
+    questions_by_user = defaultdict(list)
+    for question in all_questions:
+        owner = question.get('owner')
+        if owner and owner.get('id'):
+            questions_by_user[owner.get('id')].append(question)
+    
+    # Group unanswered questions by owner
+    unanswered_by_user = defaultdict(list)
+    for question in unanswered_questions:
+        owner = question.get('owner')
+        if owner and owner.get('id'):
+            unanswered_by_user[owner.get('id')].append(question)
+    
+    # Group accepted answer questions by owner
+    accepted_by_user = defaultdict(list)
+    for question in accepted_answer_questions:
+        owner = question.get('owner')
+        if owner and owner.get('id'):
+            accepted_by_user[owner.get('id')].append(question)
+    
+    # Group articles by owner
+    articles_by_user = defaultdict(list)
+    for article in all_articles:
+        owner = article.get('owner')
+        if owner and owner.get('id'):
+            articles_by_user[owner.get('id')].append(article)
+    
+    # Build metrics for each user
+    for user in all_users:
         user_id = user.get('id')
-        
-        # Skip processing if user_id is None or empty
         if not user_id:
-            log(f"Error: user_id is None or empty for user: {user}")
-            return None
+            continue
         
-        log(f"Processing user data for user ID: {user_id}")
-        
-        # Get detailed user info from batch cache
         detailed_info = user_details.get(user_id, {})
-        
-        # Count user's questions efficiently - only for valid user_ids
-        user_questions = []
-        for q in all_questions:
-            try:
-                if q is None:
-                    continue
-                owner = q.get('owner')
-                if owner is None:
-                    continue  # Question has no owner, skip
-                owner_id = owner.get('id')
-                if owner_id == user_id:
-                    user_questions.append(q)
-            except Exception as e:
-                log(f"Error processing question for user {user_id}: {str(e)}")
-                continue
-        
-        total_questions = len(user_questions)
-        
-        # Count user's articles efficiently - only for valid user_ids
-        user_articles = []
-        for a in all_articles:
-            try:
-                if a is None:
-                    continue
-                owner = a.get('owner')
-                if owner is None:
-                    continue  # Article has no owner, skip
-                owner_id = owner.get('id')
-                if owner_id == user_id:
-                    user_articles.append(a)
-            except Exception as e:
-                log(f"Error processing article for user {user_id}: {str(e)}")
-                continue
-        
-        total_articles = len(user_articles)
+        user_questions = questions_by_user.get(user_id, [])
+        user_unanswered = unanswered_by_user.get(user_id, [])
+        user_accepted = accepted_by_user.get(user_id, [])
+        user_articles = articles_by_user.get(user_id, [])
         
         # Calculate account longevity
-        creation_date = detailed_info.get('creation_date') if detailed_info else None
+        creation_date = detailed_info.get('creation_date')
         account_longevity = calculate_account_longevity(creation_date)
         
-        # Build efficient user data
-        user_data = {
-            # Basic user info (from API v3 users endpoint)
-            'user_id': user_id,
-            'display_name': user.get('name'),
-            'title': user.get('jobTitle'),
-            'department': user.get('department'),
-            'account_id': user.get('accountId'),
-            'user_type': user.get('role'),
+        # Get SME tags
+        sme_tags = get_user_sme_tags(user_id, all_sme_data)
+        is_sme = len(sme_tags) > 0
+        
+        # Convert epoch timestamps to UTC format
+        creation_date_utc = convert_epoch_to_utc_timestamp(creation_date)
+        last_login_date_utc = convert_epoch_to_utc_timestamp(detailed_info.get('last_access_date'))
+        
+        user_metrics[user_id] = {
+            'DisplayName': user.get('name'),
+            'Title': user.get('jobTitle'),
+            'Department': user.get('department'),
+            'Reputation': user.get('reputation', 0) or (detailed_info.get('reputation', 0) if detailed_info else 0),
+            'Account_Longevity': account_longevity,
+            'Total_Questions_Asked': len(user_questions),
+            'Total_Questions_No_Answers': len(user_unanswered),
+            'Answers': 'N/A',  # Cannot calculate without global /answers endpoint
+            'Questions_With_Accepted_Answers': len(user_accepted),
+            'Articles': len(user_articles),
+            'Location': detailed_info.get('location') if detailed_info else None,
+            'Account_ID': user.get('accountId'),
+            'Creation_Date': creation_date_utc,
+            'User_Type': user.get('role'),
+            'Is_SME': is_sme,
+            'Joined_UTC': creation_date_utc,
+            'Last_Login_Date': last_login_date_utc,
+            'Tags': sme_tags
+        }
+    
+    return user_metrics
+
+def process_question_data(question: Dict, user_metrics: Dict[int, Dict], accepted_answers: Dict[int, Dict]) -> Dict:
+    """Process a single question into question-centric format with user data and accepted answer"""
+    try:
+        if not question:
+            return None
+        
+        question_id = question.get('id')
+        if not question_id:
+            return None
+        
+        # Get question owner info
+        owner = question.get('owner', {})
+        owner_id = owner.get('id')
+        
+        # Get user metrics for the question owner
+        owner_metrics = user_metrics.get(owner_id, {}) if owner_id else {}
+        
+        # Extract question tags
+        question_tags = []
+        for tag in question.get('tags', []):
+            if isinstance(tag, dict):
+                question_tags.append(tag.get('name', ''))
+            else:
+                question_tags.append(str(tag))
+        
+        # Get accepted answer data
+        accepted_answer = accepted_answers.get(question_id)
+        accepted_answer_data = None
+        
+        if accepted_answer:
+            answer_owner = accepted_answer.get('owner', {})
+            answer_owner_id = answer_owner.get('id')
+            answer_owner_metrics = user_metrics.get(answer_owner_id, {}) if answer_owner_id else {}
             
-            # Additional info from API v2.3
-            'user_reputation': user.get('reputation', 0) or (detailed_info.get('reputation', 0) if detailed_info else 0),
-            'location': detailed_info.get('location') if detailed_info else None,
-            'creation_date': creation_date,
-            'joined_utc': creation_date,
-            'last_login_date': detailed_info.get('last_access_date') if detailed_info else None,
+            accepted_answer_data = {
+                'answer_id': accepted_answer.get('id'),
+                'creation_date': accepted_answer.get('creationDate'),
+                'score': accepted_answer.get('score'),
+                'owner': {
+                    'id': answer_owner_id,
+                    'display_name': answer_owner.get('name') or answer_owner_metrics.get('DisplayName'),
+                    'reputation': answer_owner.get('reputation') or answer_owner_metrics.get('Reputation', 'Unknown'),
+                    'account_id': answer_owner.get('accountId') or answer_owner_metrics.get('Account_ID'),
+                    'role': answer_owner.get('role') or answer_owner_metrics.get('User_Type'),
+                    'title': answer_owner_metrics.get('Title'),
+                    'department': answer_owner_metrics.get('Department'),
+                    'is_sme': answer_owner_metrics.get('Is_SME', False),
+                    'sme_tags': answer_owner_metrics.get('Tags', [])
+                }
+            }
+        
+        # Build question-centric data
+        question_data = {
+            # Question fields
+            'Question_ID': question_id,
+            'QuestionTitle': question.get('title'),
+            'QuestionTags': question_tags,
             
-            # Calculated metrics
-            'user_account_longevity_days': account_longevity,
-            'total_questions': total_questions,
-            'articles': total_articles,
+            # User fields (from owner)
+            'owner': {
+                'DisplayName': owner_metrics.get('DisplayName'),
+                'Title': owner_metrics.get('Title'),
+                'Department': owner_metrics.get('Department'),
+                'Reputation': owner_metrics.get('Reputation', 'Unknown'),
+                'Account_Longevity_Days': owner_metrics.get('Account_Longevity', 'Unknown'),
+                'Total_Questions_Asked': owner_metrics.get('Total_Questions_Asked', 'Unknown'),
+                'Total_Questions_No_Answers': owner_metrics.get('Total_Questions_No_Answers', 'Unknown'),
+                'Answers': owner_metrics.get('Answers', 'N/A'),
+                'Questions_With_Accepted_Answers': owner_metrics.get('Questions_With_Accepted_Answers', 'Unknown'),
+                'Articles': owner_metrics.get('Articles', 'Unknown'),
+                'Location': owner_metrics.get('Location'),
+                'Account_ID': owner_metrics.get('Account_ID'),
+                'Creation_Date': owner_metrics.get('Creation_Date'),
+                'Joined_UTC': owner_metrics.get('Joined_UTC'), 
+                'User_Type': owner_metrics.get('User_Type'),
+                'Is_SME': owner_metrics.get('Is_SME', False),
+                'Last_Login_Date': owner_metrics.get('Last_Login_Date'),
+                'Tags': owner_metrics.get('Tags', []),
+            },
+            
+            # Accepted Answer Data
+            'accepted_answer': accepted_answer_data,
             
             # Metadata
-            'last_updated': datetime.now().isoformat(),
-            'data_collection_timestamp': datetime.now().timestamp()
+            'Question_Creation_Date': question.get('creationDate'),
+            'Question_Score': question.get('score', 'Unknown'),
+            'Question_View_Count': question.get('viewCount', 'Unknown'),
+            'Question_Answer_Count': question.get('answerCount', 'Unknown'),
+            'Question_Is_Answered': question.get('isAnswered', False),
+            'Last_Updated': datetime.now().isoformat(),
+            'Data_Collection_Timestamp': convert_epoch_to_utc_timestamp(datetime.now().timestamp())
         }
         
-        return user_data
+        return question_data
         
     except Exception as e:
-        log(f"Unexpected error in process_user_data for user {user.get('id') if user else 'None'}: {str(e)}")
+        log(f"Unexpected error in process_question_data for question {question.get('id') if question else 'None'}: {str(e)}")
         return None
 
-def collect_powerbi_data() -> List[Dict]:
-    """Main function to collect efficient PowerBI data"""
-    log("Starting efficient PowerBI data collection")
+async def collect_powerbi_data() -> List[Dict]:
+    """Main async function to collect question-centric PowerBI data"""
+    global RATE_LIMITER
     
-    # Step 1: Get all users (single paginated API call)
-    stop_event = threading.Event()
-    loading_message = "Fetching all users..."
-    loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
+    log("Starting question-centric PowerBI data collection")
     
-    if not VERBOSE:
-        loading_thread.start()
+    # Initialize rate limiter
+    RATE_LIMITER = asyncio.Semaphore(RATE_LIMIT_REQUESTS)
     
-    try:
-        users = get_all_users()
-    finally:
-        stop_event.set()
-        if not VERBOSE:
-            loading_thread.join()
-            print("\rUser retrieval complete!        ")
+    # Create aiohttp session
+    headers = CONFIG['headers']
+    timeout = aiohttp.ClientTimeout(total=300)  # 5 minute timeout
     
-    if not users:
-        log("No users found")
-        return []
-    
-    # Check for users without user IDs and log them
-    users_without_ids = []
-    users_with_ids = []
-    
-    for user in users:
-        user_id = user.get('id')
-        account_id = user.get('accountId')
+    async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        # Step 1: Get all questions
+        stop_event = threading.Event()
+        loading_message = "Fetching all questions..."
+        loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
         
-        if not user_id:
-            users_without_ids.append(account_id or 'Unknown')
-            log(f"⚠️  Account ID '{account_id or 'Unknown'}' has no user ID - skipping from report")
-        else:
-            users_with_ids.append(user)
-    
-    # Log summary of users without IDs
-    if users_without_ids:
-        print(f"\n⚠️  WARNING: Found {len(users_without_ids)} accounts without user IDs:")
-        print(f"   Account IDs without user IDs: {', '.join(map(str, users_without_ids))}")
-        print(f"   These accounts will be excluded from the PowerBI report")
-        log(f"Accounts without user IDs: {users_without_ids}")
-    
-    log(f"Total users: {len(users)}, Users with valid IDs: {len(users_with_ids)}, Users without IDs: {len(users_without_ids)}")
-    
-    # Continue processing only with users that have valid IDs
-    users = users_with_ids
-    
-    # Step 2: Get all questions (single paginated API call)
-    stop_event = threading.Event()
-    loading_message = "Fetching all questions..."
-    loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
-    
-    if not VERBOSE:
-        loading_thread.start()
-    
-    try:
-        all_questions = get_all_questions()
-    finally:
-        stop_event.set()
         if not VERBOSE:
-            loading_thread.join()
-            print("\rQuestion retrieval complete!        ")
-    
-    # Step 3: Get all articles (single paginated API call)
-    stop_event = threading.Event()
-    loading_message = "Fetching all articles..."
-    loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
-    
-    if not VERBOSE:
-        loading_thread.start()
-    
-    try:
-        all_articles = get_all_articles()
-    finally:
-        stop_event.set()
-        if not VERBOSE:
-            loading_thread.join()
-            print("\rArticle retrieval complete!        ")
-    
-    # Step 4: Get detailed user info in batches (minimal API calls)
-    # Only get details for users with valid IDs
-    user_ids = [user.get('id') for user in users if user.get('id')]
-    
-    stop_event = threading.Event()
-    loading_message = f"Fetching detailed info for {len(user_ids)} users..."
-    loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
-    
-    if not VERBOSE:
-        loading_thread.start()
-    
-    try:
-        user_details = get_user_detailed_info_batch(user_ids)
-    finally:
-        stop_event.set()
-        if not VERBOSE:
-            loading_thread.join()
-            print("\rUser details retrieval complete!        ")
-    
-    log(f"Content summary: {len(users)} valid users, {len(all_questions)} questions, {len(all_articles)} articles")
-    
-    # Step 5: Process all users (no additional API calls)
-    log(f"Processing {len(users)} users with valid IDs")
-    
-    powerbi_data = []
-    for i, user in enumerate(users, 1):
+            loading_thread.start()
+        
         try:
-            user_data = process_user_data(user, all_questions, all_articles, user_details)
-            if user_data:
-                powerbi_data.append(user_data)
-                
-            if i % 100 == 0 or i == len(users):
-                log(f"Processed {i}/{len(users)} users")
-                
-        except Exception as e:
-            log(f"Error processing user {user.get('id')}: {str(e)}")
-    
-    log(f"Collected data for {len(powerbi_data)} users")
-    return powerbi_data
+            all_questions = await get_all_questions(session)
+        finally:
+            stop_event.set()
+            if not VERBOSE:
+                loading_thread.join()
+                print("\rQuestion retrieval complete!        ")
+        
+        if not all_questions:
+            log("No questions found")
+            return []
+        
+        # Step 2: Get unanswered questions
+        stop_event = threading.Event()
+        loading_message = "Fetching unanswered questions..."
+        loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
+        
+        if not VERBOSE:
+            loading_thread.start()
+        
+        try:
+            unanswered_questions = await get_unanswered_questions(session)
+        finally:
+            stop_event.set()
+            if not VERBOSE:
+                loading_thread.join()
+                print("\rUnanswered questions retrieval complete!        ")
+        
+        # Step 3: Get questions with accepted answers
+        stop_event = threading.Event()
+        loading_message = "Fetching questions with accepted answers..."
+        loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
+        
+        if not VERBOSE:
+            loading_thread.start()
+        
+        try:
+            accepted_answer_questions = await get_questions_with_accepted_answers(session)
+        finally:
+            stop_event.set()
+            if not VERBOSE:
+                loading_thread.join()
+                print("\rAccepted answer questions retrieval complete!        ")
+        
+        # Step 4: Get accepted answers data
+        stop_event = threading.Event()
+        loading_message = f"Fetching accepted answers for {len(accepted_answer_questions)} questions..."
+        loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
+        
+        if not VERBOSE:
+            loading_thread.start()
+        
+        try:
+            accepted_answers = await get_accepted_answers_batch(session, accepted_answer_questions)
+        finally:
+            stop_event.set()
+            if not VERBOSE:
+                loading_thread.join()
+                print("\rAccepted answers retrieval complete!        ")
+        
+        # Step 5: Get all users
+        stop_event = threading.Event()
+        loading_message = "Fetching all users..."
+        loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
+        
+        if not VERBOSE:
+            loading_thread.start()
+        
+        try:
+            all_users = await get_all_users(session)
+        finally:
+            stop_event.set()
+            if not VERBOSE:
+                loading_thread.join()
+                print("\rUser retrieval complete!        ")
+        
+        # Step 6: Get all articles
+        stop_event = threading.Event()
+        loading_message = "Fetching all articles..."
+        loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
+        
+        if not VERBOSE:
+            loading_thread.start()
+        
+        try:
+            all_articles = await get_all_articles(session)
+        finally:
+            stop_event.set()
+            if not VERBOSE:
+                loading_thread.join()
+                print("\rArticle retrieval complete!        ")
+        
+        # Step 7: Get detailed user info
+        user_ids = [user.get('id') for user in all_users if user.get('id')]
+        
+        stop_event = threading.Event()
+        loading_message = f"Fetching detailed info for {len(user_ids)} users..."
+        loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
+        
+        if not VERBOSE:
+            loading_thread.start()
+        
+        try:
+            user_details = await get_user_detailed_info_batch(session, user_ids)
+        finally:
+            stop_event.set()
+            if not VERBOSE:
+                loading_thread.join()
+                print("\rUser details retrieval complete!        ")
+        
+        # Step 8: Get SME data for all tags
+        all_tag_ids = set()
+        for question in all_questions:
+            for tag in question.get('tags', []):
+                if isinstance(tag, dict) and tag.get('id'):
+                    all_tag_ids.add(tag.get('id'))
+                    # Cache tag name for later use
+                    SME_CACHE[tag.get('id')] = tag.get('name', f"tag_{tag.get('id')}")
+        
+        stop_event = threading.Event()
+        loading_message = f"Fetching SME data for {len(all_tag_ids)} tags..."
+        loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
+        
+        if not VERBOSE:
+            loading_thread.start()
+        
+        try:
+            all_sme_data = await get_sme_data_for_tags(session, list(all_tag_ids))
+        finally:
+            stop_event.set()
+            if not VERBOSE:
+                loading_thread.join()
+                print("\rSME data retrieval complete!        ")
+        
+        log(f"Content summary: {len(all_questions)} questions, {len(all_users)} users, {len(all_articles)} articles, {len(accepted_answers)} accepted answers")
+        
+        # Step 9: Build user metrics
+        log("Building comprehensive user metrics...")
+        user_metrics = build_user_metrics(
+            all_users, all_questions, unanswered_questions, accepted_answer_questions,
+            all_articles, user_details, all_sme_data
+        )
+        
+        # Step 10: Process all questions into question-centric format
+        log(f"Processing {len(all_questions)} questions")
+        
+        powerbi_data = []
+        for i, question in enumerate(all_questions, 1):
+            try:
+                question_data = process_question_data(question, user_metrics, accepted_answers)
+                if question_data:
+                    powerbi_data.append(question_data)
+                    
+                if i % 100 == 0 or i == len(all_questions):
+                    log(f"Processed {i}/{len(all_questions)} questions")
+                    
+            except Exception as e:
+                log(f"Error processing question {question.get('id')}: {str(e)}")
+        
+        log(f"Collected question-centric data for {len(powerbi_data)} questions")
+        return powerbi_data
 
 def save_data_to_json(data: List[Dict], filename: str = None):
     """Save collected data to JSON file"""
     if not filename:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"powerbi_data_{timestamp}.json"
+        filename = f"powerbi_questions_data_{timestamp}.json"
     
     try:
         with open(filename, 'w', encoding='utf-8') as f:
@@ -534,42 +774,42 @@ def save_data_to_json(data: List[Dict], filename: str = None):
         log(f"Error saving data to JSON: {str(e)}")
         raise
 
-def export_powerbi_data():
-    """Main export function for cron job"""
+async def export_powerbi_data():
+    """Main async export function for cron job"""
     global API_V2_CALLS, API_V3_CALLS
     
     start_time = datetime.now()
-    log(f"PowerBI data export started at {start_time}")
+    log(f"Question-centric PowerBI data export started at {start_time}")
     
     # Reset counters
     API_V2_CALLS = 0
     API_V3_CALLS = 0
     
     try:
-        # Collect all data efficiently
-        powerbi_data = collect_powerbi_data()
+        # Collect all data efficiently using async
+        powerbi_data = await collect_powerbi_data()
         
         if not powerbi_data:
             log("No data collected")
             return
         
         # Save to JSON file
-        filename = CONFIG.get('output_file', 'powerbi_data.json')
+        filename = CONFIG.get('output_file', 'powerbi_questions_data.json')
         save_data_to_json(powerbi_data, filename)
         
         end_time = datetime.now()
         duration = end_time - start_time
         
         # Print summary
-        print(f"\n✅ Efficient PowerBI data export complete!")
+        print(f"\n✅ Question-centric PowerBI data export complete!")
         print(f"   Data saved to: {filename}")
-        print(f"   Total users processed: {len(powerbi_data)}")
+        print(f"   Total questions processed: {len(powerbi_data)}")
         print(f"   Total time: {duration}")
         print(f"   Total API v3 calls: {API_V3_CALLS}")
         print(f"   Total API v2.3 calls: {API_V2_CALLS}")
         print(f"   Total API calls: {API_V3_CALLS + API_V2_CALLS}")
         if len(powerbi_data) > 0:
-            print(f"   Average time per user: {duration.total_seconds() / len(powerbi_data):.2f}s")
+            print(f"   Average time per question: {duration.total_seconds() / len(powerbi_data):.3f}s")
         
         log(f"Export completed successfully in {duration}")
         
@@ -582,21 +822,21 @@ def run_cron_job():
     if not RUNNING:
         return
         
-    log("Running scheduled PowerBI data collection")
-    export_powerbi_data()
+    log("Running scheduled question-centric PowerBI data collection")
+    asyncio.run(export_powerbi_data())
 
 def main():
     global CONFIG, VERBOSE, logger
     
     # Setup argument parser
     parser = argparse.ArgumentParser(
-        description="Efficient PowerBI Data Collector for Stack Overflow Enterprise"
+        description="Async Question-Centric PowerBI Data Collector for Stack Overflow Enterprise"
     )
     parser.add_argument("--base-url", required=True, 
                        help="Stack Overflow Enterprise Base URL")
     parser.add_argument("--token", required=True, 
                        help="API access token")
-    parser.add_argument("--output-file", default="powerbi_data.json",
+    parser.add_argument("--output-file", default="powerbi_questions_data.json",
                        help="Output JSON filename")
     parser.add_argument("--verbose", "-v", action="store_true",
                        help="Enable verbose output")
@@ -623,14 +863,14 @@ def main():
         'output_file': args.output_file
     })
     
-    logger.info(f"Efficient PowerBI Data Collector starting...")
+    logger.info(f"Async Question-Centric PowerBI Data Collector starting...")
     logger.info(f"Base URL: {CONFIG['base_url']}")
     logger.info(f"Output file: {CONFIG['output_file']}")
     
     if args.run_once:
         # Run once and exit
         logger.info("Running data collection once...")
-        export_powerbi_data()
+        asyncio.run(export_powerbi_data())
     else:
         # Setup cron job
         logger.info(f"Setting up cron job with schedule: {args.cron_schedule}")
@@ -650,7 +890,7 @@ def main():
         
         # Run once immediately
         logger.info("Running initial data collection...")
-        export_powerbi_data()
+        asyncio.run(export_powerbi_data())
         
         # Start scheduler
         logger.info("Starting scheduler...")
@@ -658,7 +898,7 @@ def main():
             schedule.run_pending()
             time.sleep(60)  # Check every minute
     
-    logger.info("PowerBI Data Collector stopped")
+    logger.info("Async Question-Centric PowerBI Data Collector stopped")
 
 if __name__ == "__main__":
     main()
