@@ -11,7 +11,7 @@ import sys
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 import logging
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 from collections import defaultdict
 
 # Global counters and caches
@@ -261,6 +261,62 @@ async def get_paginated_data(session: aiohttp.ClientSession, endpoint: str, para
         
     return all_items
 
+def extract_user_ids_from_questions(questions: List[Dict]) -> Set[int]:
+    """Extract unique user IDs from question owners"""
+    user_ids = set()
+    
+    for question in questions:
+        owner = question.get('owner', {})
+        user_id = owner.get('id')
+        if user_id:
+            user_ids.add(user_id)
+    
+    return user_ids
+
+def extract_user_ids_from_accepted_answers(accepted_answers: Dict[int, Dict]) -> Set[int]:
+    """Extract unique user IDs from accepted answer owners"""
+    user_ids = set()
+    
+    for answer_data in accepted_answers.values():
+        owner = answer_data.get('owner', {})
+        user_id = owner.get('id')
+        if user_id:
+            user_ids.add(user_id)
+    
+    return user_ids
+
+async def get_users_by_ids(session: aiohttp.ClientSession, user_ids: List[int]) -> List[Dict]:
+    """Get user data for specific user IDs using v3 API"""
+    if not user_ids:
+        return []
+    
+    users = []
+    batch_size = 20  # Conservative batch size for v3 API
+    
+    for i in range(0, len(user_ids), batch_size):
+        batch = user_ids[i:i + batch_size]
+        
+        # Use individual requests for v3 API (no bulk endpoint)
+        tasks = []
+        for user_id in batch:
+            url = f"{CONFIG['base_url']}/users/{user_id}"
+            tasks.append(make_api_request(session, url))
+        
+        batch_results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for user_id, result in zip(batch, batch_results):
+            if isinstance(result, dict) and not isinstance(result, Exception):
+                users.append(result)
+            else:
+                log(f"Failed to fetch user {user_id}: {result}")
+        
+        log(f"Fetched user data for batch {i//batch_size + 1}/{(len(user_ids) + batch_size - 1)//batch_size}")
+        
+        # Small delay between batches
+        await asyncio.sleep(0.2)
+    
+    return users
+
 async def get_accepted_answer_for_question(session: aiohttp.ClientSession, question_id: int) -> Optional[Dict]:
     """Get the accepted answer for a specific question"""
     url = f"{CONFIG['base_url']}/questions/{question_id}/answers"
@@ -347,11 +403,6 @@ async def get_questions_with_accepted_answers(session: aiohttp.ClientSession) ->
     """Get all questions with accepted answers from the API with optional date filtering"""
     return await get_paginated_data(session, "questions", {"hasAcceptedAnswer": "true"})
 
-async def get_all_users(session: aiohttp.ClientSession) -> List[Dict]:
-    """Fetch all users from the API"""
-    # Users endpoint typically doesn't support date filtering, so we don't pass date params
-    return await get_paginated_data(session, "users", {})
-
 async def get_all_articles(session: aiohttp.ClientSession) -> List[Dict]:
     """Get all articles from the API with optional date filtering"""
     return await get_paginated_data(session, "articles")
@@ -434,11 +485,11 @@ def get_user_sme_tags(user_id: int, all_sme_data: Dict[int, List[int]]) -> List[
     
     return sme_tag_names
 
-def build_user_metrics(all_users: List[Dict], all_questions: List[Dict], 
-                      unanswered_questions: List[Dict], accepted_answer_questions: List[Dict],
-                      all_articles: List[Dict], user_details: Dict[int, Dict], 
-                      all_sme_data: Dict[int, List[int]]) -> Dict[int, Dict]:
-    """Build comprehensive user metrics for all users"""
+def build_user_metrics_from_question_users(question_users: List[Dict], all_questions: List[Dict], 
+                                          unanswered_questions: List[Dict], accepted_answer_questions: List[Dict],
+                                          all_articles: List[Dict], user_details: Dict[int, Dict], 
+                                          all_sme_data: Dict[int, List[int]]) -> Dict[int, Dict]:
+    """Build comprehensive user metrics for users found in questions only"""
     user_metrics = {}
     
     # Group questions by owner
@@ -469,8 +520,8 @@ def build_user_metrics(all_users: List[Dict], all_questions: List[Dict],
         if owner and owner.get('id'):
             articles_by_user[owner.get('id')].append(article)
     
-    # Build metrics for each user
-    for user in all_users:
+    # Build metrics for each user from questions
+    for user in question_users:
         user_id = user.get('id')
         if not user_id:
             continue
@@ -506,6 +557,7 @@ def build_user_metrics(all_users: List[Dict], all_questions: List[Dict],
             'Articles': len(user_articles),
             'Location': detailed_info.get('location') if detailed_info else None,
             'Account_ID': user.get('accountId'),
+            'User_ID': user_id,
             'Creation_Date': creation_date_utc,
             'User_Type': user.get('role'),
             'Is_SME': is_sme,
@@ -587,6 +639,7 @@ def process_question_data(question: Dict, user_metrics: Dict[int, Dict], accepte
                 'Articles': owner_metrics.get('Articles', 'Unknown'),
                 'Location': owner_metrics.get('Location'),
                 'Account_ID': owner_metrics.get('Account_ID'),
+                'User_ID': owner_metrics.get('User_ID'),
                 'Creation_Date': owner_metrics.get('Creation_Date'),
                 'Joined_UTC': owner_metrics.get('Joined_UTC'), 
                 'User_Type': owner_metrics.get('User_Type'),
@@ -652,7 +705,11 @@ async def collect_powerbi_data() -> List[Dict]:
             log("No questions found")
             return []
         
-        # Step 2: Get unanswered questions (with date filtering if configured)
+        # Step 2: Extract unique user IDs from questions
+        question_user_ids = extract_user_ids_from_questions(all_questions)
+        log(f"Found {len(question_user_ids)} unique users from questions")
+        
+        # Step 3: Get unanswered questions (with date filtering if configured)
         stop_event = threading.Event()
         loading_message = f"Fetching unanswered questions{filter_message}..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
@@ -668,7 +725,7 @@ async def collect_powerbi_data() -> List[Dict]:
                 loading_thread.join()
                 print("\rUnanswered questions retrieval complete!        ")
         
-        # Step 3: Get questions with accepted answers (with date filtering if configured)
+        # Step 4: Get questions with accepted answers (with date filtering if configured)
         stop_event = threading.Event()
         loading_message = f"Fetching questions with accepted answers{filter_message}..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
@@ -684,7 +741,7 @@ async def collect_powerbi_data() -> List[Dict]:
                 loading_thread.join()
                 print("\rAccepted answer questions retrieval complete!        ")
         
-        # Step 4: Get accepted answers data
+        # Step 5: Get accepted answers data
         stop_event = threading.Event()
         loading_message = f"Fetching accepted answers for {len(accepted_answer_questions)} questions..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
@@ -700,23 +757,31 @@ async def collect_powerbi_data() -> List[Dict]:
                 loading_thread.join()
                 print("\rAccepted answers retrieval complete!        ")
         
-        # Step 5: Get all users
+        # Step 6: Extract additional user IDs from accepted answers
+        answer_user_ids = extract_user_ids_from_accepted_answers(accepted_answers)
+        log(f"Found {len(answer_user_ids)} unique users from accepted answers")
+        
+        # Combine all unique user IDs
+        all_user_ids = question_user_ids.union(answer_user_ids)
+        log(f"Total unique users to fetch: {len(all_user_ids)}")
+        
+        # Step 7: Get user data for the identified users only
         stop_event = threading.Event()
-        loading_message = "Fetching all users..."
+        loading_message = f"Fetching user data for {len(all_user_ids)} users..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
         
         if not VERBOSE:
             loading_thread.start()
         
         try:
-            all_users = await get_all_users(session)
+            question_users = await get_users_by_ids(session, list(all_user_ids))
         finally:
             stop_event.set()
             if not VERBOSE:
                 loading_thread.join()
-                print("\rUser retrieval complete!        ")
+                print("\rUser data retrieval complete!        ")
         
-        # Step 6: Get all articles (with date filtering if configured)
+        # Step 8: Get all articles (with date filtering if configured) - needed for user metrics
         stop_event = threading.Event()
         loading_message = f"Fetching articles{filter_message}..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
@@ -732,25 +797,23 @@ async def collect_powerbi_data() -> List[Dict]:
                 loading_thread.join()
                 print("\rArticle retrieval complete!        ")
         
-        # Step 7: Get detailed user info
-        user_ids = [user.get('id') for user in all_users if user.get('id')]
-        
+        # Step 9: Get detailed user info for the identified users
         stop_event = threading.Event()
-        loading_message = f"Fetching detailed info for {len(user_ids)} users..."
+        loading_message = f"Fetching detailed info for {len(all_user_ids)} users..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
         
         if not VERBOSE:
             loading_thread.start()
         
         try:
-            user_details = await get_user_detailed_info_batch(session, user_ids)
+            user_details = await get_user_detailed_info_batch(session, list(all_user_ids))
         finally:
             stop_event.set()
             if not VERBOSE:
                 loading_thread.join()
                 print("\rUser details retrieval complete!        ")
         
-        # Step 8: Get SME data for all tags
+        # Step 10: Get SME data for all tags
         all_tag_ids = set()
         for question in all_questions:
             for tag in question.get('tags', []):
@@ -774,16 +837,16 @@ async def collect_powerbi_data() -> List[Dict]:
                 loading_thread.join()
                 print("\rSME data retrieval complete!        ")
         
-        log(f"Content summary: {len(all_questions)} questions, {len(all_users)} users, {len(all_articles)} articles, {len(accepted_answers)} accepted answers")
+        log(f"Content summary: {len(all_questions)} questions, {len(question_users)} users, {len(all_articles)} articles, {len(accepted_answers)} accepted answers")
         
-        # Step 9: Build user metrics
-        log("Building comprehensive user metrics...")
-        user_metrics = build_user_metrics(
-            all_users, all_questions, unanswered_questions, accepted_answer_questions,
+        # Step 11: Build user metrics for question users only
+        log("Building comprehensive user metrics for question users...")
+        user_metrics = build_user_metrics_from_question_users(
+            question_users, all_questions, unanswered_questions, accepted_answer_questions,
             all_articles, user_details, all_sme_data
         )
         
-        # Step 10: Process all questions into question-centric format
+        # Step 12: Process all questions into question-centric format
         log(f"Processing {len(all_questions)} questions")
         
         powerbi_data = []
@@ -805,14 +868,8 @@ async def collect_powerbi_data() -> List[Dict]:
 def save_data_to_json(data: List[Dict], filename: str = None):
     """Save collected data to JSON file"""
     if not filename:
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Add date range to filename if filtering is applied
-        date_part = ""
-        if CONFIG.get('from_date') and CONFIG.get('to_date'):
-            date_part = f"_{CONFIG['from_date']}_to_{CONFIG['to_date']}"
-        
-        filename = f"powerbi_questions_data{date_part}_{timestamp}.json"
+
+        filename = f"powerbi_questions_data.json"
     
     try:
         with open(filename, 'w', encoding='utf-8') as f:
@@ -855,13 +912,6 @@ async def export_powerbi_data():
         
         # Save to JSON file
         filename = CONFIG.get('output_file')
-        if not filename:
-            # Generate filename with date filter if applicable
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            date_part = ""
-            if CONFIG.get('from_date') and CONFIG.get('to_date'):
-                date_part = f"_{CONFIG['from_date']}_to_{CONFIG['to_date']}"
-            filename = f"powerbi_questions_data{date_part}_{timestamp}.json"
         
         save_data_to_json(powerbi_data, filename)
         
@@ -898,7 +948,7 @@ def main():
     
     # Setup argument parser
     parser = argparse.ArgumentParser(
-        description="Async Question-Centric PowerBI Data Collector for Stack Overflow Enterprise with Time Filtering"
+        description="Optimized Async Question-Centric PowerBI Data Collector for Stack Overflow Enterprise with Time Filtering"
     )
     parser.add_argument("--base-url", required=True, 
                        help="Stack Overflow Enterprise Base URL")
@@ -913,7 +963,7 @@ def main():
     parser.add_argument("--cron-schedule", default="0 2 * * *",
                        help="Cron schedule (default: daily at 2 AM)")
     
-    # Time filtering options (similar to knowledge reuse script)
+    # Time filtering options
     parser.add_argument("--filter", choices=["week", "month", "quarter", "year", "custom", "none"], 
                        default="none", 
                        help="Time filter for data collection (last week, month, quarter, year, custom dates, or none for all data)")
@@ -969,9 +1019,10 @@ def main():
         else:
             filter_desc = f"last {filter_type} ({from_date} to {to_date})"
     
-    logger.info(f"Async Question-Centric PowerBI Data Collector starting...")
+    logger.info(f"Optimized Async Question-Centric PowerBI Data Collector starting...")
     logger.info(f"Base URL: {CONFIG['base_url']}")
     logger.info(f"Data collection scope: {filter_desc}")
+    logger.info(f"User data collection: Only users from filtered questions and accepted answers")
     if CONFIG.get('output_file'):
         logger.info(f"Output file: {CONFIG['output_file']}")
     else:
@@ -1008,7 +1059,7 @@ def main():
             schedule.run_pending()
             time.sleep(60)  # Check every minute
     
-    logger.info("Async Question-Centric PowerBI Data Collector stopped")
+    logger.info("Optimized Async Question-Centric PowerBI Data Collector stopped")
 
 if __name__ == "__main__":
     main()
