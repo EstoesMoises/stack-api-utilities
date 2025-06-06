@@ -1,357 +1,291 @@
 # PowerBI Data Collector for Stack Overflow Enterprise
 
-A Python script that collects user activity data from Stack Overflow Enterprise API v3 and exports it to JSON format for PowerBI dashboard consumption. The script supports both one-time execution and automated cron job scheduling.
+NOT PRODUCTION READY. THIS IS FOR DEMONSTRATION PURPOSES. SOFTWARE IS PROVIDED "AS IS"
+
+An optimized async Python script that collects question-centric data from Stack Overflow Enterprise for PowerBI reporting and analytics.
 
 ## Features
 
-- 🔄 **Automated Data Collection**: Scheduled cron jobs for regular data updates
-- 🚀 **High Performance**: Multi-threaded processing with intelligent caching
-- 📊 **PowerBI Ready**: Structured JSON output optimized for PowerBI dashboards
-- 🛡️ **Robust Error Handling**: Comprehensive logging and graceful failure recovery
-- ⚡ **API Optimization**: Minimizes API calls through smart caching strategies
-- 🎯 **Comprehensive Metrics**: Collects 20+ data points per user
+- **Question-Centric Data Collection**: Focuses on questions and enriches them with user metrics and accepted answer data
+- **Async Processing**: High-performance concurrent API requests with intelligent rate limiting
+- **Time Filtering**: Flexible date range filtering (last week, month, quarter, year, or custom ranges)
+- **Comprehensive User Metrics**: Detailed user information including SME status, reputation, and activity metrics
+- **Accepted Answer Tracking**: Links questions with their accepted answers and answerer details
+- **Scheduled Execution**: Built-in cron job support for automated data collection
+- **Rate Limiting**: Respects API limits with automatic retry and backoff logic
+- **Robust Error Handling**: Graceful handling of API errors and timeouts
 
-## Data Collected
+## Requirements
 
-The script collects comprehensive user activity data including:
+- Python 3.7+
+- Stack Overflow Enterprise instance with API access
+- Valid API access token
 
-### User Information
-- User ID and Display Name
-- Job Title and Department
-- User Reputation and Account ID
-- User Type and Location
-- Creation Date and Last Login
+### Dependencies
 
-### Activity Metrics
-- Total Questions (with breakdown of unanswered)
-- Total Answers (with acceptance rate)
-- Median Answer Time (in hours)
-- Articles and Comments count
-- Total Upvotes across all content
-
-### Content References
-- Associated Tags
-- Question IDs and Titles
-- Answer IDs
-- Content timestamps
+```bash
+pip install aiohttp asyncio schedule
+```
 
 ## Installation
 
-### Prerequisites
-- Python 3.7 or higher
-- Stack Overflow Enterprise API access token
-- Network access to your Stack Overflow Enterprise instance
-
-### Setup
-```bash
-# Clone or download the script
-git clone <repository-url>
-cd powerbi-data-collector
-
-# Install dependencies
-pip install -r requirements.txt
-
-# Make script executable (Linux/Mac)
-chmod +x powerbi_collector.py
-```
-
-## Configuration
-
-### Environment Variables (Optional)
-```bash
-export SOE_BASE_URL="https://your-site.stackoverflow.com"
-export SOE_API_TOKEN="your-api-token"
-export POWERBI_OUTPUT_FILE="powerbi_data.json"
-```
-
-### Command Line Arguments
-| Argument | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `--base-url` | Yes | - | Stack Overflow Enterprise base URL |
-| `--token` | Yes | - | API access token |
-| `--output-file` | No | `powerbi_data.json` | Output JSON filename |
-| `--verbose` | No | False | Enable detailed logging |
-| `--threads` | No | 5 | Number of concurrent threads |
-| `--run-once` | No | False | Run once and exit (no cron) |
-| `--cron-schedule` | No | `0 2 * * *` | Cron schedule format |
+1. Clone or download the script
+2. Install dependencies:
+   ```bash
+   pip install aiohttp schedule
+   ```
+3. Ensure you have a valid Stack Overflow Enterprise API token
 
 ## Usage
 
-### One-Time Execution
+### Basic Usage
+
 ```bash
-# Basic usage
+python powerbi_collector.py --base-url https://your-enterprise.stackoverflowteams.com --token YOUR_API_TOKEN
+```
+
+### Command Line Options
+
+| Option | Description | Required |
+|--------|-------------|----------|
+| `--base-url` | Stack Overflow Enterprise Base URL | Yes |
+| `--token` | API access token | Yes |
+| `--output-file` | Output JSON filename (auto-generated if not specified) | No |
+| `--verbose`, `-v` | Enable verbose output | No |
+| `--run-once` | Run once and exit (no cron job) | No |
+| `--cron-schedule` | Cron schedule (default: daily at 2 AM) | No |
+| `--filter` | Time filter: `week`, `month`, `quarter`, `year`, `custom`, `none` | No |
+| `--from-date` | Start date for custom filter (YYYY-MM-DD) | No* |
+| `--to-date` | End date for custom filter (YYYY-MM-DD) | No* |
+
+*Required when using `--filter=custom`
+
+### Examples
+
+#### Collect All Data (Run Once)
+```bash
 python powerbi_collector.py \
-  --base-url https://your-site.stackoverflow.com \
+  --base-url https://your-enterprise.stackoverflowteams.com \
   --token YOUR_API_TOKEN \
   --run-once
+```
 
-# With custom output file and verbose logging
+#### Collect Last Month's Data
+```bash
 python powerbi_collector.py \
-  --base-url https://your-site.stackoverflow.com \
+  --base-url https://your-enterprise.stackoverflowteams.com \
   --token YOUR_API_TOKEN \
-  --output-file monthly_data.json \
+  --filter month \
+  --run-once
+```
+
+#### Custom Date Range
+```bash
+python powerbi_collector.py \
+  --base-url https://your-enterprise.stackoverflowteams.com \
+  --token YOUR_API_TOKEN \
+  --filter custom \
+  --from-date 2024-01-01 \
+  --to-date 2024-03-31 \
+  --run-once
+```
+
+#### Scheduled Collection (Daily at 3 AM)
+```bash
+python powerbi_collector.py \
+  --base-url https://your-enterprise.stackoverflowteams.com \
+  --token YOUR_API_TOKEN \
+  --cron-schedule "0 3 * * *" \
+  --filter week
+```
+
+#### Verbose Output
+```bash
+python powerbi_collector.py \
+  --base-url https://your-enterprise.stackoverflowteams.com \
+  --token YOUR_API_TOKEN \
   --verbose \
   --run-once
 ```
 
-### Scheduled Execution (Cron Job)
-```bash
-# Daily at 2 AM (default)
-python powerbi_collector.py \
-  --base-url https://your-site.stackoverflow.com \
-  --token YOUR_API_TOKEN
-
-# Custom schedule - Daily at 6 AM
-python powerbi_collector.py \
-  --base-url https://your-site.stackoverflow.com \
-  --token YOUR_API_TOKEN \
-  --cron-schedule "0 6 * * *"
-
-# High-performance mode with more threads
-python powerbi_collector.py \
-  --base-url https://your-site.stackoverflow.com \
-  --token YOUR_API_TOKEN \
-  --threads 10 \
-  --verbose
-```
-
-### Running as a Service (Linux)
-Create a systemd service file:
-
-```bash
-sudo nano /etc/systemd/system/powerbi-collector.service
-```
-
-```ini
-[Unit]
-Description=PowerBI Data Collector for Stack Overflow Enterprise
-After=network.target
-
-[Service]
-Type=simple
-User=your-username
-WorkingDirectory=/path/to/powerbi-collector
-ExecStart=/usr/bin/python3 /path/to/powerbi-collector/powerbi_collector.py \
-  --base-url https://your-site.stackoverflow.com \
-  --token YOUR_API_TOKEN \
-  --output-file /data/powerbi_data.json
-Restart=always
-RestartSec=60
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and start the service:
-```bash
-sudo systemctl enable powerbi-collector.service
-sudo systemctl start powerbi-collector.service
-sudo systemctl status powerbi-collector.service
-```
-
 ## Output Format
 
-The script generates a JSON file with the following structure:
+The script generates a JSON file containing an array of question objects. Each question includes:
 
+### Question Data
+- Question ID, title, tags
+- Creation date, score, view count, answer count
+- Whether the question is answered
+
+### Question Owner Data
+- Display name, title, department
+- Reputation, account longevity
+- Question/answer statistics
+- SME status and tags
+- Account creation and last login dates
+
+### Accepted Answer Data (if available)
+- Answer ID, creation date, score
+- Answer owner details (name, reputation, SME status, etc.)
+
+### Example Output Structure
 ```json
 [
   {
-    "user_id": 123,
-    "display_name": "John Doe",
-    "user_job_title": "Senior Developer",
-    "user_job_department": "Engineering",
-    "user_reputation": 2500,
-    "total_questions": 45,
-    "total_questions_no_answer": 3,
-    "answers": 120,
-    "answers_accepted": 85,
-    "median_answer_time_hours": 4.5,
-    "articles": 12,
-    "comments": 200,
-    "total_upvotes": 1200,
-    "location": "New York, NY",
-    "account_id": 456,
-    "creation_date": 1609459200,
-    "user_type": "registered",
-    "joined_utc": 1609459200,
-    "last_login_date": 1704067200,
-    "tags": ["python", "javascript", "api"],
-    "question_ids": [1001, 1002, 1003],
-    "answer_ids": [2001, 2002, 2003],
-    "question_titles": ["How to optimize API calls?", "Best practices for error handling"],
-    "last_updated": "2024-01-01T12:00:00",
-    "data_collection_timestamp": 1704110400.0
+    "Question_ID": 12345,
+    "QuestionTitle": "How to implement async processing?",
+    "QuestionTags": ["python", "async", "processing"],
+    "owner": {
+      "DisplayName": "John Doe",
+      "Title": "Senior Developer",
+      "Department": "Engineering",
+      "Reputation": 1500,
+      "Account_Longevity_Days": 365,
+      "Is_SME": true,
+      "Tags": ["python", "javascript"]
+    },
+    "accepted_answer": {
+      "answer_id": 67890,
+      "creation_date": "2024-01-15T10:30:00.000",
+      "score": 5,
+      "owner": {
+        "display_name": "Jane Smith",
+        "reputation": 2500,
+        "is_sme": true
+      }
+    },
+    "Question_Creation_Date": "2024-01-10T14:20:00.000",
+    "Question_Score": 3,
+    "Question_View_Count": 150,
+    "Question_Is_Answered": true
   }
 ]
 ```
 
-## PowerBI Integration
+## Performance Features
 
-### Connecting to PowerBI
-1. **Get Data** → **JSON** → Select your output file
-2. **Transform Data** to expand nested arrays (tags, question_ids, etc.)
-3. **Create relationships** between user data and activity metrics
-4. **Set up automatic refresh** to reload updated JSON files
+### Rate Limiting
+- Respects Stack Overflow Enterprise API limits (45 requests per 2 seconds)
+- Automatic retry with exponential backoff on rate limit errors
+- Concurrent request processing with semaphore-based throttling
 
-### Recommended Visualizations
-- **User Activity Dashboard**: Questions vs Answers ratio
-- **Department Performance**: Activity by department/job title
-- **Response Time Analysis**: Median answer time trends
-- **Tag Cloud**: Most active technology areas
-- **Reputation vs Activity**: Correlation analysis
-- **Geographic Distribution**: User activity by location
+### Efficient Data Collection
+- Async processing for improved performance
+- Batch processing for user data retrieval
+- Intelligent caching to avoid duplicate API calls
+- Minimal data collection (only users from filtered questions)
 
-### Sample DAX Measures
-```dax
-# Average Response Time
-Average Response Time = AVERAGE('UserData'[median_answer_time_hours])
+### Memory Optimization
+- Streaming JSON output for large datasets
+- Efficient data structures to minimize memory usage
+- Garbage collection-friendly processing patterns
 
-# Question Answer Ratio
-Answer Ratio = DIVIDE(SUM('UserData'[answers]), SUM('UserData'[total_questions]), 0)
+## Time Filtering
 
-# Activity Score
-Activity Score = 
-  ('UserData'[total_questions] * 2) + 
-  ('UserData'[answers] * 3) + 
-  ('UserData'[articles] * 5) + 
-  ('UserData'[comments] * 1)
+The script supports flexible time filtering to collect data for specific periods:
+
+- **`week`**: Last 7 days
+- **`month`**: Last 30 days  
+- **`quarter`**: Last 90 days (default)
+- **`year`**: Last 365 days
+- **`custom`**: Specify exact date range with `--from-date` and `--to-date`
+- **`none`**: Collect all available data 
+
+Date filtering applies to questions, and the script automatically includes associated users and accepted answers.
+
+## Logging
+
+The script creates two types of logs:
+
+1. **Console Output**: Real-time progress and status updates
+2. **Log File**: Detailed logging saved to `powerbi_collector.log`
+
+Use `--verbose` for detailed debug output.
+
+## Error Handling
+
+The script includes robust error handling for:
+- API rate limiting (429 errors)
+- Network timeouts and connectivity issues
+- Invalid API responses
+- Missing or malformed data
+- Graceful shutdown on interrupt signals
+
+## Scheduling
+
+### Built-in Cron Support
+The script includes built-in scheduling using cron syntax:
+```bash
+# Daily at 2 AM (default)
+--cron-schedule "0 2 * * *"
+
+# Every 6 hours
+--cron-schedule "0 */6 * * *"
+
+# Weekdays at 9 AM
+--cron-schedule "0 9 * * 1-5"
 ```
 
-## Monitoring and Logging
+### System Cron Alternative
+You can also use system cron for scheduling:
+```bash
+# Add to crontab
+0 2 * * * /usr/bin/python3 /path/to/powerbi_collector.py --base-url https://your-enterprise.stackoverflowteams.com --token YOUR_TOKEN --run-once --filter week
+```
 
-### Log Files
-- **powerbi_collector.log**: Detailed execution logs
-- **Console Output**: Real-time progress and summary statistics
+## API Usage
 
-### Log Levels
-- **INFO**: General execution progress
-- **DEBUG**: Detailed API calls and caching info (with `--verbose`)
-- **ERROR**: Failed operations and exceptions
+The script uses both Stack Overflow Enterprise API v3 and v2.3:
+- **API v3**: Primary data collection (questions, users, SME data)
+- **API v2.3**: Additional user details and bulk operations
 
-### Performance Metrics
-The script tracks and reports:
-- Total execution time
-- API call counts (v2.3 and v3)
-- Cache hit rates
-- Users processed per minute
-- Data collection timestamps
+### API Call Optimization
+- Minimizes API calls through intelligent batching
+- Focuses data collection on relevant users only
+- Uses pagination efficiently
+- Implements connection pooling for performance
 
 ## Troubleshooting
 
 ### Common Issues
 
-**1. Authentication Errors**
+**Rate Limiting Errors**
+- The script automatically handles rate limiting
+- Reduce `RATE_LIMIT_REQUESTS` if issues persist
+- Check your API token permissions
+
+**Timeout Errors**
+- Increase timeout values in the code if needed
+- Check network connectivity to your Enterprise instance
+- Verify the base URL is correct
+
+**Authentication Errors**
+- Verify your API token is valid and has proper permissions
+- Ensure the token has read access to questions, users, and answers
+
+**Memory Issues**
+- Use time filtering to reduce dataset size
+- Consider running on a machine with more RAM for large datasets
+
+### Debug Mode
+Run with `--verbose` to see detailed API calls and processing steps:
+```bash
+python powerbi_collector.py --verbose --base-url YOUR_URL --token YOUR_TOKEN --run-once
 ```
-Error: HTTP 401 - Unauthorized
-```
-- Verify your API token is valid and has necessary permissions
-- Check if token has expired
-- Ensure you're using the correct base URL
 
-**2. Rate Limiting**
-```
-Error: HTTP 429 - Too Many Requests
-```
-- Reduce the number of threads with `--threads 3`
-- Implement delays between API calls
-- Contact your Stack Overflow Enterprise admin about rate limits
+## Security
 
-**3. Memory Issues**
-```
-MemoryError: Unable to allocate array
-```
-- Reduce thread count
-- Process data in smaller batches
-- Consider running on a machine with more RAM
-
-**4. Network Timeouts**
-```
-requests.exceptions.ConnectTimeout
-```
-- Check network connectivity to your Stack Overflow Enterprise instance
-- Increase timeout values in the script
-- Verify firewall settings
-
-### Performance Optimization
-
-**For Large Instances (1000+ users):**
-- Use `--threads 3` to reduce server load
-- Run during off-peak hours
-- Consider incremental data collection
-- Monitor API quota usage
-
-**For Better PowerBI Performance:**
-- Split large datasets by date ranges
-- Use compressed JSON format
-- Implement data archiving strategy
-- Consider database storage for very large datasets
-
-## API Usage and Limits
-
-### API Endpoints Used
-- **API v3**: Primary data collection
-  - `/users` - User listings
-  - `/users/{id}/questions` - User questions
-  - `/users/{id}/answers` - User answers
-  - `/users/{id}/comments` - User comments
-  - `/users/{id}/articles` - User articles
-
-- **API v2.3**: Detailed user information
-  - `/users/{id}` - Reputation, creation dates, etc.
-
-### Estimated API Calls
-For N users:
-- **Minimum**: N + (N × 5) calls
-- **Maximum**: N + (N × 20) calls (depending on user activity)
-- **Caching reduces subsequent runs by 60-80%**
+- API tokens are passed via command line (consider using environment variables)
+- No sensitive data is logged
+- HTTPS is enforced for all API communications
+- Consider using a service account token for automated collection
 
 ## Contributing
 
-### Development Setup
-```bash
-# Create virtual environment
-python -m venv powerbi-env
-source powerbi-env/bin/activate  # Linux/Mac
-# or
-powerbi-env\Scripts\activate  # Windows
+To modify or extend the script:
 
-# Install development dependencies
-pip install -r requirements.txt
-pip install pytest black flake8
-```
+1. The main collection logic is in `collect_powerbi_data()`
+2. Question processing is handled by `process_question_data()`
+3. User metrics are built in `build_user_metrics_from_question_users()`
+4. Rate limiting is managed by the `RATE_LIMITER` semaphore
 
-### Running Tests
-```bash
-# Unit tests
-pytest tests/
-
-# Linting
-flake8 powerbi_collector.py
-black powerbi_collector.py
-```
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
-
-## Support
-
-For issues and questions:
-1. Check the troubleshooting section above
-2. Review log files for detailed error information
-3. Create an issue with:
-   - Complete error message
-   - Command used
-   - Log file excerpt
-   - Environment details (Python version, OS, etc.)
-
-## Changelog
-
-### v1.0.0
-- Initial release
-- API v3 support with bearer token authentication
-- Multi-threaded data collection
-- Comprehensive user activity metrics
-- Cron job scheduling
-- PowerBI-optimized JSON output
-- Intelligent caching system

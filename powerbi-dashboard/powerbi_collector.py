@@ -965,7 +965,7 @@ def main():
     
     # Time filtering options
     parser.add_argument("--filter", choices=["week", "month", "quarter", "year", "custom", "none"], 
-                       default="none", 
+                       default="quarter", 
                        help="Time filter for data collection (last week, month, quarter, year, custom dates, or none for all data)")
     parser.add_argument("--from-date", 
                        help="Start date for custom filter (format: YYYY-MM-DD)")
