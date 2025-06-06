@@ -8,12 +8,11 @@ import threading
 import schedule
 import signal
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse
 import logging
 from typing import Dict, List, Optional
 from collections import defaultdict
-import statistics
 
 # Global counters and caches
 API_V2_CALLS = 0
@@ -72,6 +71,32 @@ def get_api_v2_url(base_url: str) -> str:
     """Get API v2.3 URL for additional data"""
     parsed_url = urlparse(base_url.strip())
     return f"{parsed_url.scheme}://{parsed_url.netloc}/api/2.3"
+
+def get_date_range(time_filter):
+    """Generate from/to dates based on the selected time filter"""
+    today = datetime.now()
+    
+    if time_filter == "week":
+        # Last week
+        from_date = (today - timedelta(days=7)).strftime("%Y-%m-%d")
+    elif time_filter == "month":
+        # Last month
+        from_date = (today - timedelta(days=30)).strftime("%Y-%m-%d")
+    elif time_filter == "quarter":
+        # Last quarter (90 days)
+        from_date = (today - timedelta(days=90)).strftime("%Y-%m-%d")
+    elif time_filter == "year":
+        # Last year
+        from_date = (today - timedelta(days=365)).strftime("%Y-%m-%d")
+    elif time_filter == "custom":
+        # Custom range will be handled via explicit from_date/to_date parameters
+        return None, None
+    else:
+        # No filter - return None to indicate no date filtering
+        return None, None
+        
+    to_date = today.strftime("%Y-%m-%d")
+    return from_date, to_date
 
 def convert_epoch_to_utc_timestamp(epoch_timestamp):
     """Convert epoch timestamp to UTC timestamp format like 2024-01-03T17:21:01.323"""
@@ -185,15 +210,31 @@ async def make_api_v2_request(session: aiohttp.ClientSession, url: str, params: 
     return None
 
 async def get_paginated_data(session: aiohttp.ClientSession, endpoint: str, params: Dict = None) -> List[Dict]:
-    """Generic async function to get all paginated data from an endpoint"""
+    """Generic async function to get all paginated data from an endpoint with optional date filtering"""
     all_items = []
     page = 1
     total_pages = None
     
-    log(f"Starting to fetch all data from {endpoint}")
+    # Add date filtering to params if configured
+    if params is None:
+        params = {}
+    
+    # Add date filter if configured in CONFIG
+    if CONFIG.get('from_date') and CONFIG.get('to_date'):
+        params.update({
+            'from': CONFIG['from_date'],
+            'to': CONFIG['to_date']
+        })
+        log(f"Applying date filter: from {CONFIG['from_date']} to {CONFIG['to_date']}")
+    
+    filter_message = ""
+    if CONFIG.get('from_date') and CONFIG.get('to_date'):
+        filter_message = f" with date filter from {CONFIG['from_date']} to {CONFIG['to_date']}"
+    
+    log(f"Starting to fetch all data from {endpoint}{filter_message}")
     
     while True:
-        current_params = params.copy() if params else {}
+        current_params = params.copy()
         current_params.update({'page': page, 'pageSize': 100})
         
         url = f"{CONFIG['base_url']}/{endpoint}"
@@ -295,23 +336,24 @@ async def get_accepted_answers_batch(session: aiohttp.ClientSession, questions_w
     return accepted_answers
 
 async def get_all_questions(session: aiohttp.ClientSession) -> List[Dict]:
-    """Get all questions from the API"""
+    """Get all questions from the API with optional date filtering"""
     return await get_paginated_data(session, "questions")
 
 async def get_unanswered_questions(session: aiohttp.ClientSession) -> List[Dict]:
-    """Get all unanswered questions from the API"""
+    """Get all unanswered questions from the API with optional date filtering"""
     return await get_paginated_data(session, "questions", {"isAnswered": "false"})
 
 async def get_questions_with_accepted_answers(session: aiohttp.ClientSession) -> List[Dict]:
-    """Get all questions with accepted answers from the API"""
+    """Get all questions with accepted answers from the API with optional date filtering"""
     return await get_paginated_data(session, "questions", {"hasAcceptedAnswer": "true"})
 
 async def get_all_users(session: aiohttp.ClientSession) -> List[Dict]:
     """Fetch all users from the API"""
-    return await get_paginated_data(session, "users")
+    # Users endpoint typically doesn't support date filtering, so we don't pass date params
+    return await get_paginated_data(session, "users", {})
 
 async def get_all_articles(session: aiohttp.ClientSession) -> List[Dict]:
-    """Get all articles from the API"""
+    """Get all articles from the API with optional date filtering"""
     return await get_paginated_data(session, "articles")
 
 async def get_user_detailed_info_batch(session: aiohttp.ClientSession, user_ids: List[int], batch_size: int = 20) -> Dict[int, Dict]:
@@ -541,7 +583,6 @@ def process_question_data(question: Dict, user_metrics: Dict[int, Dict], accepte
                 'Account_Longevity_Days': owner_metrics.get('Account_Longevity', 'Unknown'),
                 'Total_Questions_Asked': owner_metrics.get('Total_Questions_Asked', 'Unknown'),
                 'Total_Questions_No_Answers': owner_metrics.get('Total_Questions_No_Answers', 'Unknown'),
-                'Answers': owner_metrics.get('Answers', 'N/A'),
                 'Questions_With_Accepted_Answers': owner_metrics.get('Questions_With_Accepted_Answers', 'Unknown'),
                 'Articles': owner_metrics.get('Articles', 'Unknown'),
                 'Location': owner_metrics.get('Location'),
@@ -577,7 +618,11 @@ async def collect_powerbi_data() -> List[Dict]:
     """Main async function to collect question-centric PowerBI data"""
     global RATE_LIMITER
     
-    log("Starting question-centric PowerBI data collection")
+    filter_message = ""
+    if CONFIG.get('from_date') and CONFIG.get('to_date'):
+        filter_message = f" with date filter from {CONFIG['from_date']} to {CONFIG['to_date']}"
+    
+    log(f"Starting question-centric PowerBI data collection{filter_message}")
     
     # Initialize rate limiter
     RATE_LIMITER = asyncio.Semaphore(RATE_LIMIT_REQUESTS)
@@ -587,9 +632,9 @@ async def collect_powerbi_data() -> List[Dict]:
     timeout = aiohttp.ClientTimeout(total=300)  # 5 minute timeout
     
     async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-        # Step 1: Get all questions
+        # Step 1: Get all questions (with date filtering if configured)
         stop_event = threading.Event()
-        loading_message = "Fetching all questions..."
+        loading_message = f"Fetching questions{filter_message}..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
         
         if not VERBOSE:
@@ -607,9 +652,9 @@ async def collect_powerbi_data() -> List[Dict]:
             log("No questions found")
             return []
         
-        # Step 2: Get unanswered questions
+        # Step 2: Get unanswered questions (with date filtering if configured)
         stop_event = threading.Event()
-        loading_message = "Fetching unanswered questions..."
+        loading_message = f"Fetching unanswered questions{filter_message}..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
         
         if not VERBOSE:
@@ -623,9 +668,9 @@ async def collect_powerbi_data() -> List[Dict]:
                 loading_thread.join()
                 print("\rUnanswered questions retrieval complete!        ")
         
-        # Step 3: Get questions with accepted answers
+        # Step 3: Get questions with accepted answers (with date filtering if configured)
         stop_event = threading.Event()
-        loading_message = "Fetching questions with accepted answers..."
+        loading_message = f"Fetching questions with accepted answers{filter_message}..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
         
         if not VERBOSE:
@@ -671,9 +716,9 @@ async def collect_powerbi_data() -> List[Dict]:
                 loading_thread.join()
                 print("\rUser retrieval complete!        ")
         
-        # Step 6: Get all articles
+        # Step 6: Get all articles (with date filtering if configured)
         stop_event = threading.Event()
-        loading_message = "Fetching all articles..."
+        loading_message = f"Fetching articles{filter_message}..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
         
         if not VERBOSE:
@@ -761,7 +806,13 @@ def save_data_to_json(data: List[Dict], filename: str = None):
     """Save collected data to JSON file"""
     if not filename:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"powerbi_questions_data_{timestamp}.json"
+        
+        # Add date range to filename if filtering is applied
+        date_part = ""
+        if CONFIG.get('from_date') and CONFIG.get('to_date'):
+            date_part = f"_{CONFIG['from_date']}_to_{CONFIG['to_date']}"
+        
+        filename = f"powerbi_questions_data{date_part}_{timestamp}.json"
     
     try:
         with open(filename, 'w', encoding='utf-8') as f:
@@ -779,7 +830,16 @@ async def export_powerbi_data():
     global API_V2_CALLS, API_V3_CALLS
     
     start_time = datetime.now()
-    log(f"Question-centric PowerBI data export started at {start_time}")
+    
+    # Create filter message for logging
+    filter_message = ""
+    if CONFIG.get('filter_type'):
+        if CONFIG['filter_type'] == "custom":
+            filter_message = f" for custom date range (from {CONFIG['from_date']} to {CONFIG['to_date']})"
+        else:
+            filter_message = f" for the last {CONFIG['filter_type']} (from {CONFIG['from_date']} to {CONFIG['to_date']})"
+    
+    log(f"Question-centric PowerBI data export started at {start_time}{filter_message}")
     
     # Reset counters
     API_V2_CALLS = 0
@@ -794,7 +854,15 @@ async def export_powerbi_data():
             return
         
         # Save to JSON file
-        filename = CONFIG.get('output_file', 'powerbi_questions_data.json')
+        filename = CONFIG.get('output_file')
+        if not filename:
+            # Generate filename with date filter if applicable
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            date_part = ""
+            if CONFIG.get('from_date') and CONFIG.get('to_date'):
+                date_part = f"_{CONFIG['from_date']}_to_{CONFIG['to_date']}"
+            filename = f"powerbi_questions_data{date_part}_{timestamp}.json"
+        
         save_data_to_json(powerbi_data, filename)
         
         end_time = datetime.now()
@@ -803,7 +871,7 @@ async def export_powerbi_data():
         # Print summary
         print(f"\n✅ Question-centric PowerBI data export complete!")
         print(f"   Data saved to: {filename}")
-        print(f"   Total questions processed: {len(powerbi_data)}")
+        print(f"   Total questions processed{filter_message}: {len(powerbi_data)}")
         print(f"   Total time: {duration}")
         print(f"   Total API v3 calls: {API_V3_CALLS}")
         print(f"   Total API v2.3 calls: {API_V2_CALLS}")
@@ -830,14 +898,14 @@ def main():
     
     # Setup argument parser
     parser = argparse.ArgumentParser(
-        description="Async Question-Centric PowerBI Data Collector for Stack Overflow Enterprise"
+        description="Async Question-Centric PowerBI Data Collector for Stack Overflow Enterprise with Time Filtering"
     )
     parser.add_argument("--base-url", required=True, 
                        help="Stack Overflow Enterprise Base URL")
     parser.add_argument("--token", required=True, 
                        help="API access token")
-    parser.add_argument("--output-file", default="powerbi_questions_data.json",
-                       help="Output JSON filename")
+    parser.add_argument("--output-file",
+                       help="Output JSON filename (auto-generated if not specified)")
     parser.add_argument("--verbose", "-v", action="store_true",
                        help="Enable verbose output")
     parser.add_argument("--run-once", action="store_true",
@@ -845,7 +913,21 @@ def main():
     parser.add_argument("--cron-schedule", default="0 2 * * *",
                        help="Cron schedule (default: daily at 2 AM)")
     
+    # Time filtering options (similar to knowledge reuse script)
+    parser.add_argument("--filter", choices=["week", "month", "quarter", "year", "custom", "none"], 
+                       default="none", 
+                       help="Time filter for data collection (last week, month, quarter, year, custom dates, or none for all data)")
+    parser.add_argument("--from-date", 
+                       help="Start date for custom filter (format: YYYY-MM-DD)")
+    parser.add_argument("--to-date", 
+                       help="End date for custom filter (format: YYYY-MM-DD)")
+    
     args = parser.parse_args()
+    
+    # Validate custom filter arguments
+    if args.filter == "custom" and (not args.from_date or not args.to_date):
+        print("Error: --from-date and --to-date are required when using --filter=custom")
+        sys.exit(1)
     
     # Setup logging
     VERBOSE = args.verbose
@@ -855,17 +937,45 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
     
+    # Get date range based on filter
+    if args.filter == "custom":
+        from_date = args.from_date
+        to_date = args.to_date
+        filter_type = "custom"
+    elif args.filter == "none":
+        from_date = None
+        to_date = None
+        filter_type = None
+    else:
+        from_date, to_date = get_date_range(args.filter)
+        filter_type = args.filter
+    
     # Setup global configuration
     CONFIG.update({
         'base_url': force_api_v3(args.base_url),
         'api_v2_base': get_api_v2_url(args.base_url),
         'headers': {'Authorization': f'Bearer {args.token}'},
-        'output_file': args.output_file
+        'output_file': args.output_file,
+        'from_date': from_date,
+        'to_date': to_date,
+        'filter_type': filter_type
     })
+    
+    # Create filter description for logging
+    filter_desc = "all data"
+    if filter_type:
+        if filter_type == "custom":
+            filter_desc = f"custom date range ({from_date} to {to_date})"
+        else:
+            filter_desc = f"last {filter_type} ({from_date} to {to_date})"
     
     logger.info(f"Async Question-Centric PowerBI Data Collector starting...")
     logger.info(f"Base URL: {CONFIG['base_url']}")
-    logger.info(f"Output file: {CONFIG['output_file']}")
+    logger.info(f"Data collection scope: {filter_desc}")
+    if CONFIG.get('output_file'):
+        logger.info(f"Output file: {CONFIG['output_file']}")
+    else:
+        logger.info("Output file: Auto-generated with timestamp and date range")
     
     if args.run_once:
         # Run once and exit
