@@ -62,15 +62,48 @@ def loading_animation(stop_event, message):
         print(f"\r{message} {next(spinner)}", end='', flush=True)
         time.sleep(0.2)
 
-def force_api_v3(base_url: str) -> str:
-    """Force URL to use API v3"""
+def detect_instance_type(base_url: str) -> tuple:
+    """
+    Detect if this is a Teams or Enterprise instance and extract relevant info.
+    Returns: (instance_type, team_slug_or_none)
+    """
     parsed_url = urlparse(base_url.strip())
-    return f"{parsed_url.scheme}://{parsed_url.netloc}/api/v3"
+    
+    # Check if it's a Teams instance
+    if 'stackoverflowteams.com' in parsed_url.netloc:
+        return 'teams', None
+    elif parsed_url.netloc.endswith('.stackenterprise.co') or 'enterprise' in parsed_url.netloc:
+        return 'enterprise', None
+    else:
+        # Could be a custom domain for either type - we'll default to enterprise behavior
+        # but allow override via team-slug parameter
+        return 'enterprise', None
 
-def get_api_v2_url(base_url: str) -> str:
-    """Get API v2.3 URL for additional data"""
+def build_api_urls(base_url: str, team_slug: str = None) -> tuple:
+    """
+    Build the appropriate API URLs based on instance type.
+    Returns: (api_v3_base, api_v2_base, instance_type)
+    """
     parsed_url = urlparse(base_url.strip())
-    return f"{parsed_url.scheme}://{parsed_url.netloc}/api/2.3"
+    instance_type, _ = detect_instance_type(base_url)
+    
+    if instance_type == 'teams' or team_slug:
+        # Teams instance
+        if not team_slug:
+
+                raise ValueError("Team slug is required for Teams instances. Please provide --team-slug parameter.")
+        
+        # Teams API URLs
+        api_v3_base = f"https://api.stackoverflowteams.com/v3/teams/{team_slug}"
+        api_v2_base = f"https://api.stackoverflowteams.com/2.3"
+        instance_type = 'teams'
+    else:
+        # Enterprise instance
+        api_v3_base = f"{parsed_url.scheme}://{parsed_url.netloc}/api/v3"
+        api_v2_base = f"{parsed_url.scheme}://{parsed_url.netloc}/api/2.3"
+        instance_type = 'enterprise'
+    
+    return api_v3_base, api_v2_base, instance_type
 
 def get_date_range(time_filter):
     """Generate from/to dates based on the selected time filter"""
@@ -237,7 +270,7 @@ async def get_paginated_data(session: aiohttp.ClientSession, endpoint: str, para
         current_params = params.copy()
         current_params.update({'page': page, 'pageSize': 100})
         
-        url = f"{CONFIG['base_url']}/{endpoint}"
+        url = f"{CONFIG['api_v3_base']}/{endpoint}"
         log(f"Fetching page {page}/{total_pages or '?'} from {endpoint}")
         
         data = await make_api_request(session, url, current_params)
@@ -267,7 +300,8 @@ def extract_user_ids_from_questions(questions: List[Dict]) -> Set[int]:
     
     for question in questions:
         owner = question.get('owner', {})
-        user_id = owner.get('id')
+        if owner:
+            user_id = owner.get('id')
         if user_id:
             user_ids.add(user_id)
     
@@ -299,7 +333,7 @@ async def get_users_by_ids(session: aiohttp.ClientSession, user_ids: List[int]) 
         # Use individual requests for v3 API (no bulk endpoint)
         tasks = []
         for user_id in batch:
-            url = f"{CONFIG['base_url']}/users/{user_id}"
+            url = f"{CONFIG['api_v3_base']}/users/{user_id}"
             tasks.append(make_api_request(session, url))
         
         batch_results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -319,7 +353,7 @@ async def get_users_by_ids(session: aiohttp.ClientSession, user_ids: List[int]) 
 
 async def get_accepted_answer_for_question(session: aiohttp.ClientSession, question_id: int) -> Optional[Dict]:
     """Get the accepted answer for a specific question"""
-    url = f"{CONFIG['base_url']}/questions/{question_id}/answers"
+    url = f"{CONFIG['api_v3_base']}/questions/{question_id}/answers"
     
     # Get first page to find accepted answer
     data = await make_api_request(session, url, {'page': 1, 'pageSize': 100})
@@ -410,32 +444,46 @@ async def get_all_articles(session: aiohttp.ClientSession) -> List[Dict]:
 async def get_user_detailed_info_batch(session: aiohttp.ClientSession, user_ids: List[int], batch_size: int = 20) -> Dict[int, Dict]:
     """Get detailed user information from API v2.3 in batches"""
     user_details = {}
-    
+
     # Filter out None values from user_ids
     valid_user_ids = [uid for uid in user_ids if uid is not None]
-    
+
     if not valid_user_ids:
         log("No valid user IDs to fetch detailed info for")
         return user_details
-    
+
     for i in range(0, len(valid_user_ids), batch_size):
         batch = valid_user_ids[i:i + batch_size]
-        
-        # Convert batch to semicolon-separated string for v2.3 API
         ids_string = ";".join(map(str, batch))
-        
-        v2_url = f"{CONFIG['api_v2_base']}/users/{ids_string}?order=desc&sort=reputation"
-        log(f"Batch fetching detailed info for {len(batch)} users")
-        
-        user_data = await make_api_v2_request(session, v2_url)
-        
+
+        v2_url = f"{CONFIG['api_v2_base']}/users/{ids_string}"
+        log(f"Batch fetching detailed info for {len(batch)} users from {v2_url}")
+
+        # Build params dict and exclude None values
+        params = {
+            "order": "desc",
+            "sort": "reputation",
+            "key": CONFIG.get("api_key"),
+            "access_token": CONFIG.get("token")
+        }
+
+        if CONFIG["instance_type"] == "teams" and CONFIG.get("team_slug"):
+            params["team"] = CONFIG["team_slug"]
+
+        # Remove any None values from params
+        params = {k: v for k, v in params.items() if v is not None}
+
+        user_data = await make_api_v2_request(session, v2_url, params)
+
         if user_data and 'items' in user_data:
             for user_item in user_data['items']:
                 user_id = user_item.get('user_id') if user_item else None
                 if user_id:
                     user_details[user_id] = user_item
-                    
+
     return user_details
+
+
 
 async def get_sme_data_for_tags(session: aiohttp.ClientSession, tag_ids: List[int]) -> Dict[int, List[int]]:
     """Get SME data for given tag IDs. Returns dict of tag_id -> list of user_ids"""
@@ -448,7 +496,7 @@ async def get_sme_data_for_tags(session: aiohttp.ClientSession, tag_ids: List[in
         tasks = []
         
         for tag_id in batch:
-            url = f"{CONFIG['base_url']}/tags/{tag_id}/subject-matter-experts"
+            url = f"{CONFIG['api_v3_base']}/tags/{tag_id}/subject-matter-experts"
             tasks.append(make_api_request(session, url))
         
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -868,7 +916,6 @@ async def collect_powerbi_data() -> List[Dict]:
 def save_data_to_json(data: List[Dict], filename: str = None):
     """Save collected data to JSON file"""
     if not filename:
-
         filename = f"powerbi_questions_data.json"
     
     try:
@@ -948,12 +995,14 @@ def main():
     
     # Setup argument parser
     parser = argparse.ArgumentParser(
-        description="Optimized Async Question-Centric PowerBI Data Collector for Stack Overflow Enterprise with Time Filtering"
+        description="Universal Async Question-Centric PowerBI Data Collector for Stack Overflow Enterprise & Teams with Time Filtering"
     )
     parser.add_argument("--base-url", required=True, 
-                       help="Stack Overflow Enterprise Base URL")
+                       help="Stack Overflow Enterprise or Teams Base URL")
     parser.add_argument("--token", required=True, 
                        help="API access token")
+    parser.add_argument("--team-slug",
+                       help="Team slug (required for Teams instances, auto-detected if not provided)")
     parser.add_argument("--output-file",
                        help="Output JSON filename (auto-generated if not specified)")
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -965,7 +1014,7 @@ def main():
     
     # Time filtering options
     parser.add_argument("--filter", choices=["week", "month", "quarter", "year", "custom", "none"], 
-                       default="quarter", 
+                       default="none", 
                        help="Time filter for data collection (last week, month, quarter, year, custom dates, or none for all data)")
     parser.add_argument("--from-date", 
                        help="Start date for custom filter (format: YYYY-MM-DD)")
@@ -1000,15 +1049,24 @@ def main():
         from_date, to_date = get_date_range(args.filter)
         filter_type = args.filter
     
+    # Build API URLs and detect instance type
+    try:
+        api_v3_base, api_v2_base, instance_type = build_api_urls(args.base_url, args.team_slug)
+    except ValueError as e:
+        print(f"Error: {e}")
+        sys.exit(1)
+    
     # Setup global configuration
     CONFIG.update({
-        'base_url': force_api_v3(args.base_url),
-        'api_v2_base': get_api_v2_url(args.base_url),
+        'api_v3_base': api_v3_base,
+        'api_v2_base': api_v2_base,
         'headers': {'Authorization': f'Bearer {args.token}'},
         'output_file': args.output_file,
         'from_date': from_date,
         'to_date': to_date,
-        'filter_type': filter_type
+        'filter_type': filter_type,
+        'instance_type': instance_type,
+        'team_slug': args.team_slug
     })
     
     # Create filter description for logging
@@ -1019,8 +1077,10 @@ def main():
         else:
             filter_desc = f"last {filter_type} ({from_date} to {to_date})"
     
-    logger.info(f"Optimized Async Question-Centric PowerBI Data Collector starting...")
-    logger.info(f"Base URL: {CONFIG['base_url']}")
+    logger.info(f"Universal Async Question-Centric PowerBI Data Collector starting...")
+    logger.info(f"Instance type: {instance_type.title()}")
+    logger.info(f"API v3 Base URL: {CONFIG['api_v3_base']}")
+    logger.info(f"API v2.3 Base URL: {CONFIG['api_v2_base']}")
     logger.info(f"Data collection scope: {filter_desc}")
     logger.info(f"User data collection: Only users from filtered questions and accepted answers")
     if CONFIG.get('output_file'):
@@ -1059,7 +1119,7 @@ def main():
             schedule.run_pending()
             time.sleep(60)  # Check every minute
     
-    logger.info("Optimized Async Question-Centric PowerBI Data Collector stopped")
+    logger.info("Universal Async Question-Centric PowerBI Data Collector stopped")
 
 if __name__ == "__main__":
     main()
