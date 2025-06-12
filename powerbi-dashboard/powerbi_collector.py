@@ -190,6 +190,20 @@ def get_date_range(time_filter):
     to_date = today.strftime("%Y-%m-%d")
     return from_date, to_date
 
+def convert_date_to_epoch(date_string: str) -> int:
+    """Convert YYYY-MM-DD date string to epoch timestamp"""
+    if not date_string:
+        return None
+    
+    try:
+        dt = datetime.strptime(date_string, '%Y-%m-%d')
+        # Set to start of day (00:00:00)
+        dt = dt.replace(hour=0, minute=0, second=0, microsecond=0)
+        return int(dt.timestamp())
+    except ValueError as e:
+        log(f"Error converting date {date_string} to epoch: {str(e)}")
+        return None
+
 def convert_epoch_to_utc_timestamp(epoch_timestamp):
     """Convert epoch timestamp to UTC timestamp format like 2024-01-03T17:21:01.323"""
     if not epoch_timestamp:
@@ -358,79 +372,224 @@ async def make_api_v2_request(session: aiohttp.ClientSession, url: str, params: 
                 await asyncio.sleep(1)
                 continue
 
-async def get_paginated_data(session: aiohttp.ClientSession, endpoint: str, params: Dict = None) -> List[Dict]:
-    """Generic async function to get all paginated data from an endpoint with optional date filtering"""
-    all_items = []
+async def get_users_created_in_timeframe(session: aiohttp.ClientSession) -> List[Dict]:
+    """Get users created within the specified timeframe"""
+    all_users = []
     page = 1
     total_pages = None
     
-    # Add date filtering to params if configured
-    if params is None:
-        params = {}
+    # Convert date strings to epoch timestamps for filtering
+    from_epoch = None
+    to_epoch = None
     
-    # Add date filter if configured in CONFIG and not getting all users
-    if CONFIG.get('from_date') and CONFIG.get('to_date') and endpoint != "users":
-        params.update({
-            'from': CONFIG['from_date'],
-            'to': CONFIG['to_date']
-        })
-        log(f"Applying date filter: from {CONFIG['from_date']} to {CONFIG['to_date']}")
+    if CONFIG.get('from_date') and CONFIG.get('to_date'):
+        from_epoch = convert_date_to_epoch(CONFIG['from_date'])
+        to_epoch = convert_date_to_epoch(CONFIG['to_date']) + 86400  # Add 24 hours to include end date
+        log(f"Filtering users created between {CONFIG['from_date']} and {CONFIG['to_date']}")
+        log(f"Epoch range: {from_epoch} to {to_epoch}")
     
-    filter_message = ""
-    if CONFIG.get('from_date') and CONFIG.get('to_date') and endpoint != "users":
-        filter_message = f" with date filter from {CONFIG['from_date']} to {CONFIG['to_date']}"
+    log(f"Starting to fetch users created in specified timeframe")
     
-    log(f"Starting to fetch all data from {endpoint}{filter_message}")
+    # If no date filter is specified, use the original logic
+    if not from_epoch or not to_epoch:
+        log("No date filter specified, fetching all users from API v3")
+        while True:
+            params = {'page': page, 'pageSize': 100}
+            
+            url = f"{CONFIG['api_v3_base']}/users"
+            log(f"Fetching page {page}/{total_pages or '?'} from users endpoint")
+            
+            data = await make_api_request(session, url, params)
+            if not data:
+                break
+                
+            users = data.get("items", [])
+            all_users.extend(users)
+            
+            if total_pages is None:
+                total_pages = data.get("totalPages", 1)
+                log(f"Total pages to fetch: {total_pages}")
+            
+            log(f"Retrieved {len(users)} users from page {page}/{total_pages} (total collected: {len(all_users)})")
+            
+            if page >= total_pages:
+                log(f"All pages fetched. Total users: {len(all_users)}")
+                break
+            
+            page += 1
+        
+        return all_users
+    
+    # When date filtering is needed, we need to get users from API v2.3 which has creation_date
+    log("Date filter specified, fetching users from API v2.3 with creation_date")
+    
+    # First, get all user IDs from API v3
+    log("Step 1: Getting all user IDs from API v3")
+    all_user_ids = []
+    v3_page = 1
+    v3_total_pages = None
     
     while True:
-        current_params = params.copy()
-        current_params.update({'page': page, 'pageSize': 100})
+        params = {'page': v3_page, 'pageSize': 100}
+        url = f"{CONFIG['api_v3_base']}/users"
         
-        url = f"{CONFIG['api_v3_base']}/{endpoint}"
-        log(f"Fetching page {page}/{total_pages or '?'} from {endpoint}")
-        
-        data = await make_api_request(session, url, current_params)
+        data = await make_api_request(session, url, params)
         if not data:
             break
             
-        items = data.get("items", [])
-        all_items.extend(items)
+        users = data.get("items", [])
+        user_ids = [user.get('id') for user in users if user.get('id')]
+        all_user_ids.extend(user_ids)
+        
+        if v3_total_pages is None:
+            v3_total_pages = data.get("totalPages", 1)
+        
+        log(f"Retrieved {len(user_ids)} user IDs from v3 page {v3_page}/{v3_total_pages}")
+        
+        if v3_page >= v3_total_pages:
+            break
+            
+        v3_page += 1
+    
+    log(f"Total user IDs collected from API v3: {len(all_user_ids)}")
+    
+    # Step 2: Get detailed user info from API v2.3 in batches and filter by creation_date
+    log("Step 2: Getting detailed user info from API v2.3 and applying date filter")
+    
+    filtered_users = []
+    batch_size = 20  # API v2.3 batch size limit
+    
+    for i in range(0, len(all_user_ids), batch_size):
+        batch_ids = all_user_ids[i:i + batch_size]
+        ids_string = ";".join(map(str, batch_ids))
+        
+        # Build API v2.3 URL
+        v2_url = f"{CONFIG['api_v2_base']}/users/{ids_string}"
+        
+        # Build params dict and exclude None values
+        params = {
+            "order": "desc",
+            "sort": "creation",
+            "key": CONFIG.get("api_key"),
+            "access_token": CONFIG.get("token")
+        }
+        
+        if CONFIG["instance_type"] == "teams" and CONFIG.get("team_slug"):
+            params["team"] = CONFIG["team_slug"]
+        
+        # Remove any None values from params
+        params = {k: v for k, v in params.items() if v is not None}
+        
+        log(f"Fetching batch {i//batch_size + 1}/{(len(all_user_ids) + batch_size - 1)//batch_size} from API v2.3")
+        
+        user_data = await make_api_v2_request(session, v2_url, params)
+        
+        if user_data and 'items' in user_data:
+            for user_item in user_data['items']:
+                creation_date = user_item.get('creation_date')
+                
+                # Apply date filter
+                if creation_date and from_epoch <= creation_date <= to_epoch:
+                    # Convert v2.3 user format back to v3-like format for consistency
+                    v3_formatted_user = {
+                        'id': user_item.get('user_id'),
+                        'name': user_item.get('display_name'),
+                        'accountId': user_item.get('account_id'),
+                        'reputation': user_item.get('reputation'),
+                        'creationDate': creation_date,  # Add this for consistency
+                        'role': user_item.get('user_type'),
+                        # Add other fields as needed
+                        'location': user_item.get('location'),
+                        'jobTitle': None,  # v2.3 doesn't have job title
+                        'department': None  # v2.3 doesn't have department
+                    }
+                    
+                    filtered_users.append(v3_formatted_user)
+                    log(f"User {user_item.get('user_id')} ({user_item.get('display_name')}) created in timeframe: {convert_epoch_to_utc_timestamp(creation_date)}")
+        
+        # Small delay between batches to respect rate limits
+        await asyncio.sleep(0.1)
+    
+    log(f"Filtered users in timeframe: {len(filtered_users)}")
+    
+    # Step 3: For the filtered users, get their complete v3 data to maintain data structure consistency
+    if filtered_users:
+        log("Step 3: Getting complete v3 data for filtered users")
+        
+        # Get the v3 user data for consistency with the rest of the pipeline
+        complete_users = []
+        filtered_user_ids = [user['id'] for user in filtered_users]
+        
+        # Fetch complete v3 data in smaller batches
+        v3_batch_size = 10
+        for i in range(0, len(filtered_user_ids), v3_batch_size):
+            batch_ids = filtered_user_ids[i:i + v3_batch_size]
+            
+            # Create tasks to fetch individual user data from v3
+            tasks = []
+            for user_id in batch_ids:
+                url = f"{CONFIG['api_v3_base']}/users/{user_id}"
+                tasks.append(make_api_request(session, url))
+            
+            # Execute batch requests
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for user_id, result in zip(batch_ids, results):
+                if isinstance(result, dict) and 'id' in result:
+                    # Add the creation date from our v2.3 data
+                    filtered_user = next((u for u in filtered_users if u['id'] == user_id), None)
+                    if filtered_user:
+                        result['creationDate'] = filtered_user['creationDate']
+                    complete_users.append(result)
+                else:
+                    # Fall back to the v2.3 formatted data if v3 fetch fails
+                    filtered_user = next((u for u in filtered_users if u['id'] == user_id), None)
+                    if filtered_user:
+                        complete_users.append(filtered_user)
+            
+            log(f"Retrieved complete v3 data for batch {i//v3_batch_size + 1}/{(len(filtered_user_ids) + v3_batch_size - 1)//v3_batch_size}")
+            
+            # Small delay between batches
+            await asyncio.sleep(0.1)
+        
+        all_users = complete_users
+    else:
+        all_users = filtered_users
+    
+    log(f"Final user count after filtering: {len(all_users)}")
+    return all_users
+async def get_questions_for_user(session: aiohttp.ClientSession, user_id: int) -> List[Dict]:
+    """Get all questions for a specific user using authorId parameter"""
+    all_questions = []
+    page = 1
+    total_pages = None
+    
+    log(f"Fetching questions for user {user_id}")
+    
+    while True:
+        params = {'page': page, 'pageSize': 100, 'authorId': user_id}
+        
+        url = f"{CONFIG['api_v3_base']}/questions"
+        
+        data = await make_api_request(session, url, params)
+        if not data:
+            break
+            
+        questions = data.get("items", [])
+        all_questions.extend(questions)
         
         if total_pages is None:
             total_pages = data.get("totalPages", 1)
-            log(f"Total pages to fetch: {total_pages}")
-        
-        log(f"Retrieved {len(items)} items from page {page}/{total_pages}")
         
         if page >= total_pages:
-            log(f"All pages fetched. Total items: {len(all_items)}")
             break
         
         page += 1
         
-    return all_items
+    log(f"Retrieved {len(all_questions)} questions for user {user_id}")
+    return all_questions
 
-async def get_all_users(session: aiohttp.ClientSession) -> List[Dict]:
-    """Get ALL users from the instance (no date filtering)"""
-    return await get_paginated_data(session, "users")
-
-async def get_all_questions(session: aiohttp.ClientSession) -> List[Dict]:
-    """Get all questions from the API with optional date filtering"""
-    return await get_paginated_data(session, "questions")
-
-async def get_unanswered_questions(session: aiohttp.ClientSession) -> List[Dict]:
-    """Get all unanswered questions from the API with optional date filtering"""
-    return await get_paginated_data(session, "questions", {"isAnswered": "false"})
-
-async def get_questions_with_accepted_answers(session: aiohttp.ClientSession) -> List[Dict]:
-    """Get all questions with accepted answers from the API with optional date filtering"""
-    return await get_paginated_data(session, "questions", {"hasAcceptedAnswer": "true"})
-
-async def get_all_articles(session: aiohttp.ClientSession) -> List[Dict]:
-    """Get all articles from the API with optional date filtering"""
-    return await get_paginated_data(session, "articles")
-
-async def get_all_answers_for_questions(session: aiohttp.ClientSession, questions: List[Dict]) -> List[Dict]:
+async def get_answers_for_questions(session: aiohttp.ClientSession, questions: List[Dict]) -> List[Dict]:
     """Get all answers for the given questions"""
     all_answers = []
     
@@ -445,7 +604,6 @@ async def get_all_answers_for_questions(session: aiohttp.ClientSession, question
                 return []
             
             try:
-                # Get answers for this specific question
                 answers = await get_paginated_data_for_question_answers(session, question_id)
                 return answers
             except Exception as e:
@@ -478,17 +636,8 @@ async def get_paginated_data_for_question_answers(session: aiohttp.ClientSession
     page = 1
     total_pages = None
     
-    log(f"Fetching answers for question {question_id}")
-    
     while True:
         params = {'page': page, 'pageSize': 100}
-        
-        # Add date filter if configured in CONFIG
-        if CONFIG.get('from_date') and CONFIG.get('to_date'):
-            params.update({
-                'from': CONFIG['from_date'],
-                'to': CONFIG['to_date']
-            })
         
         url = f"{CONFIG['api_v3_base']}/questions/{question_id}/answers"
         
@@ -508,152 +657,6 @@ async def get_paginated_data_for_question_answers(session: aiohttp.ClientSession
         page += 1
         
     return all_answers
-
-def extract_user_ids_from_questions(questions: List[Dict]) -> Set[int]:
-    """Extract unique user IDs from question owners"""
-    user_ids = set()
-    
-    for question in questions:
-        owner = question.get('owner', {})
-        if owner:
-            user_id = owner.get('id')
-        if user_id:
-            user_ids.add(user_id)
-    
-    return user_ids
-
-def extract_user_ids_from_answers(answers: List[Dict]) -> Set[int]:
-    """Extract unique user IDs from answer owners"""
-    user_ids = set()
-    
-    for answer in answers:
-        owner = answer.get('owner', {})
-        if owner:
-            user_id = owner.get('id')
-        if user_id:
-            user_ids.add(user_id)
-    
-    return user_ids
-
-def extract_user_ids_from_articles(articles: List[Dict]) -> Set[int]:
-    """Extract unique user IDs from article owners"""
-    user_ids = set()
-    
-    for article in articles:
-        owner = article.get('owner', {})
-        if owner:
-            user_id = owner.get('id')
-        if user_id:
-            user_ids.add(user_id)
-    
-    return user_ids
-
-def extract_user_ids_from_accepted_answers(accepted_answers: Dict[int, Dict]) -> Set[int]:
-    """Extract unique user IDs from accepted answer owners"""
-    user_ids = set()
-    
-    for answer_data in accepted_answers.values():
-        owner = answer_data.get('owner', {})
-        user_id = owner.get('id')
-        if user_id:
-            user_ids.add(user_id)
-    
-    return user_ids
-
-async def get_accepted_answer_for_question(session: aiohttp.ClientSession, question_id: int) -> Optional[Dict]:
-    """Get the accepted answer for a specific question - now optimized since we already have all answers"""
-    # This function is now mainly used as a backup if we need to fetch a specific accepted answer
-    # that wasn't captured in the main answers collection
-    url = f"{CONFIG['api_v3_base']}/questions/{question_id}/answers"
-    
-    # Get first page to find accepted answer
-    data = await make_api_request(session, url, {'page': 1, 'pageSize': 100})
-    if not data or not data.get('items'):
-        return None
-    
-    # Find the accepted answer
-    for answer in data['items']:
-        if answer.get('isAccepted', False):
-            return {
-                'id': answer.get('id'),
-                'creationDate': answer.get('creationDate'),
-                'score': answer.get('score'),
-                'owner': answer.get('owner')
-            }
-    
-    # If not found in first page, check remaining pages
-    total_pages = data.get("totalPages", 1)
-    for page in range(2, total_pages + 1):
-        page_data = await make_api_request(session, url, {'page': page, 'pageSize': 100})
-        if not page_data or not page_data.get('items'):
-            continue
-            
-        for answer in page_data['items']:
-            if answer.get('isAccepted', False):
-                return {
-                    'id': answer.get('id'),
-                    'creationDate': answer.get('creationDate'),
-                    'score': answer.get('score'),
-                    'owner': answer.get('owner')
-                }
-    
-    return None
-
-def extract_accepted_answers_from_all_answers(all_answers: List[Dict]) -> Dict[int, Dict]:
-    """Extract accepted answers from the complete answers collection"""
-    accepted_answers = {}
-    
-    for answer in all_answers:
-        if answer.get('isAccepted', False):
-            question_id = answer.get('questionId')
-            if question_id:
-                accepted_answers[question_id] = {
-                    'id': answer.get('id'),
-                    'creationDate': answer.get('creationDate'),
-                    'score': answer.get('score'),
-                    'owner': answer.get('owner')
-                }
-                log(f"Found accepted answer {answer.get('id')} for question {question_id}")
-    
-    log(f"Extracted {len(accepted_answers)} accepted answers from answers collection")
-    return accepted_answers
-
-async def get_accepted_answers_batch(session: aiohttp.ClientSession, questions_with_accepted: List[Dict]) -> Dict[int, Dict]:
-    """Get accepted answers for questions that have them, using async batch processing"""
-    accepted_answers = {}
-    
-    # Create semaphore for concurrent requests (respecting rate limits)
-    concurrent_limit = min(20, BURST_LIMIT_REQUESTS // 2)  # Conservative limit
-    semaphore = asyncio.Semaphore(concurrent_limit)
-    
-    async def fetch_accepted_answer(question):
-        async with semaphore:
-            question_id = question.get('id')
-            if not question_id:
-                return
-            
-            try:
-                accepted_answer = await get_accepted_answer_for_question(session, question_id)
-                if accepted_answer:
-                    accepted_answers[question_id] = accepted_answer
-                    log(f"Found accepted answer for question {question_id}")
-            except Exception as e:
-                log(f"Error fetching accepted answer for question {question_id}: {str(e)}")
-    
-    # Process in batches to avoid overwhelming the API
-    batch_size = 50
-    for i in range(0, len(questions_with_accepted), batch_size):
-        batch = questions_with_accepted[i:i + batch_size]
-        log(f"Processing accepted answers batch {i//batch_size + 1}/{(len(questions_with_accepted) + batch_size - 1)//batch_size}")
-        
-        tasks = [fetch_accepted_answer(question) for question in batch]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Small delay between batches
-        await asyncio.sleep(0.5)
-    
-    log(f"Retrieved {len(accepted_answers)} accepted answers")
-    return accepted_answers
 
 async def get_user_detailed_info_batch(session: aiohttp.ClientSession, user_ids: List[int], batch_size: int = 20) -> Dict[int, Dict]:
     """Get detailed user information from API v2.3 in batches"""
@@ -745,66 +748,42 @@ def get_user_sme_tags(user_id: int, all_sme_data: Dict[int, List[int]]) -> List[
     
     return sme_tag_names
 
-def build_user_metrics_from_all_users(all_users: List[Dict], all_questions: List[Dict], 
-                                    unanswered_questions: List[Dict], accepted_answer_questions: List[Dict],
-                                    all_articles: List[Dict], all_answers: List[Dict], user_details: Dict[int, Dict], 
-                                    all_sme_data: Dict[int, List[int]], participated_user_ids: Set[int]) -> Dict[int, Dict]:
-    """Build comprehensive user metrics for ALL users with participation flag"""
-    user_metrics = {}
+def extract_accepted_answers_from_all_answers(all_answers: List[Dict]) -> Dict[int, Dict]:
+    """Extract accepted answers from the complete answers collection"""
+    accepted_answers = {}
     
-    # Group questions by owner
-    questions_by_user = defaultdict(list)
-    for question in all_questions:
-        owner = question.get('owner')
-        if owner and owner.get('id'):
-            questions_by_user[owner.get('id')].append(question)
-    
-    # Group unanswered questions by owner
-    unanswered_by_user = defaultdict(list)
-    for question in unanswered_questions:
-        owner = question.get('owner')
-        if owner and owner.get('id'):
-            unanswered_by_user[owner.get('id')].append(question)
-    
-    # Group accepted answer questions by owner
-    accepted_by_user = defaultdict(list)
-    for question in accepted_answer_questions:
-        owner = question.get('owner')
-        if owner and owner.get('id'):
-            accepted_by_user[owner.get('id')].append(question)
-    
-    # Group articles by owner
-    articles_by_user = defaultdict(list)
-    for article in all_articles:
-        owner = article.get('owner')
-        if owner and owner.get('id'):
-            articles_by_user[owner.get('id')].append(article)
-    
-    # Group answers by owner
-    answers_by_user = defaultdict(list)
     for answer in all_answers:
-        owner = answer.get('owner')
-        if owner and owner.get('id'):
-            answers_by_user[owner.get('id')].append(answer)
+        if answer.get('isAccepted', False):
+            question_id = answer.get('questionId')
+            if question_id:
+                accepted_answers[question_id] = {
+                    'id': answer.get('id'),
+                    'creationDate': answer.get('creationDate'),
+                    'score': answer.get('score'),
+                    'owner': answer.get('owner')
+                }
+                log(f"Found accepted answer {answer.get('id')} for question {question_id}")
     
-    # Build metrics for ALL users
-    for user in all_users:
+    log(f"Extracted {len(accepted_answers)} accepted answers from answers collection")
+    return accepted_answers
+
+def process_user_data(user: Dict, user_details: Dict, user_questions: List[Dict], 
+                     user_answers: List[Dict], accepted_answers: Dict[int, Dict], 
+                     all_sme_data: Dict[int, List[int]]) -> Dict:
+    """Process a single user into user-centric format with all their questions"""
+    try:
+        if not user:
+            return None
+        
         user_id = user.get('id')
         if not user_id:
-            continue
+            return None
         
+        # Get detailed user info
         detailed_info = user_details.get(user_id, {})
-        user_questions = questions_by_user.get(user_id, [])
-        user_unanswered = unanswered_by_user.get(user_id, [])
-        user_accepted = accepted_by_user.get(user_id, [])
-        user_articles = articles_by_user.get(user_id, [])
-        user_answers = answers_by_user.get(user_id, [])
-        
-        # Check if user has participated in the filtered period
-        has_participated = user_id in participated_user_ids
         
         # Calculate account longevity
-        creation_date = detailed_info.get('creation_date')
+        creation_date = user.get('creationDate') or detailed_info.get('creation_date')
         account_longevity = calculate_account_longevity(creation_date)
         
         # Get SME tags
@@ -815,142 +794,113 @@ def build_user_metrics_from_all_users(all_users: List[Dict], all_questions: List
         creation_date_utc = convert_epoch_to_utc_timestamp(creation_date)
         last_login_date_utc = convert_epoch_to_utc_timestamp(detailed_info.get('last_access_date'))
         
-        user_metrics[user_id] = {
+        # Process user's questions with their answers
+        processed_questions = []
+        for question in user_questions:
+            question_id = question.get('id')
+            
+            # Get question tags
+            question_tags = []
+            for tag in question.get('tags', []):
+                if isinstance(tag, dict):
+                    question_tags.append(tag.get('name', ''))
+                else:
+                    question_tags.append(str(tag))
+            
+            # Get accepted answer data if available
+            accepted_answer = accepted_answers.get(question_id)
+            accepted_answer_data = None
+            
+            if accepted_answer:
+                answer_owner = accepted_answer.get('owner', {})
+                accepted_answer_data = {
+                    'answer_id': accepted_answer.get('id'),
+                    'creation_date': accepted_answer.get('creationDate'),
+                    'score': accepted_answer.get('score'),
+                    'owner': {
+                        'id': answer_owner.get('id'),
+                        'display_name': answer_owner.get('name'),
+                        'reputation': answer_owner.get('reputation'),
+                        'account_id': answer_owner.get('accountId'),
+                        'role': answer_owner.get('role')
+                    }
+                }
+            
+            # Get answers for this question
+            question_answers = [answer for answer in user_answers if answer.get('questionId') == question_id]
+            
+            question_data = {
+                'question_id': question_id,
+                'title': question.get('title'),
+                'tags': question_tags,
+                'creation_date': question.get('creationDate'),
+                'score': question.get('score', 0),
+                'view_count': question.get('viewCount', 0),
+                'answer_count': question.get('answerCount', 0),
+                'is_answered': question.get('isAnswered', "Not retrieved"),
+                'has_accepted_answer': bool(accepted_answer_data),
+                'accepted_answer': accepted_answer_data,
+                'answers': question_answers
+            }
+            processed_questions.append(question_data)
+        
+        # Calculate user metrics
+        questions_with_accepted_answers = len([q for q in user_questions if q.get('hasAcceptedAnswer', False)])
+        unanswered_questions = len([q for q in user_questions if not q.get('isAnswered', False)])
+        
+        # Build user-centric data
+        user_data = {
+            # User Basic Info
+            'User_ID': user_id,
             'DisplayName': user.get('name'),
+            'Account_ID': user.get('accountId'),
             'Title': user.get('jobTitle'),
             'Department': user.get('department'),
-            'Reputation': user.get('reputation', 0) or (detailed_info.get('reputation', 0) if detailed_info else 0),
-            'Account_Longevity': account_longevity,
-            'Total_Questions_Asked': len(user_questions),
-            'Total_Questions_No_Answers': len(user_unanswered),
-            'Total_Answers': len(user_answers),
-            'Questions_With_Accepted_Answers': len(user_accepted),
-            'Articles': len(user_articles),
             'Location': detailed_info.get('location') if detailed_info else None,
-            'Account_ID': user.get('accountId'),
-            'User_ID': user_id,
-            'Creation_Date': creation_date_utc,
             'User_Type': user.get('role'),
-            'Is_SME': is_sme,
+            
+            # User Metrics
+            'Reputation': user.get('reputation', 0) or (detailed_info.get('reputation', 0) if detailed_info else 0),
+            'Account_Longevity_Days': account_longevity,
+            'Creation_Date': creation_date_utc,
             'Joined_UTC': creation_date_utc,
             'Last_Login_Date': last_login_date_utc,
-            'Tags': sme_tags,
-            'Has_Participated': has_participated  # New field indicating participation in filtered period
-        }
-    
-    return user_metrics
-
-def process_question_data(question: Dict, user_metrics: Dict[int, Dict], accepted_answers: Dict[int, Dict]) -> Dict:
-    """Process a single question into question-centric format with user data and accepted answer"""
-    try:
-        if not question:
-            return None
-        
-        question_id = question.get('id')
-        if not question_id:
-            return None
-        
-        # Get question owner info
-        owner = question.get('owner', {})
-        owner_id = owner.get('id')
-        
-        # Get user metrics for the question owner
-        owner_metrics = user_metrics.get(owner_id, {}) if owner_id else {}
-        
-        # Extract question tags
-        question_tags = []
-        for tag in question.get('tags', []):
-            if isinstance(tag, dict):
-                question_tags.append(tag.get('name', ''))
-            else:
-                question_tags.append(str(tag))
-        
-        # Get accepted answer data
-        accepted_answer = accepted_answers.get(question_id)
-        accepted_answer_data = None
-        
-        if accepted_answer:
-            answer_owner = accepted_answer.get('owner', {})
-            answer_owner_id = answer_owner.get('id')
-            answer_owner_metrics = user_metrics.get(answer_owner_id, {}) if answer_owner_id else {}
             
-            accepted_answer_data = {
-                'answer_id': accepted_answer.get('id'),
-                'creation_date': accepted_answer.get('creationDate'),
-                'score': accepted_answer.get('score'),
-                'owner': {
-                    'id': answer_owner_id,
-                    'display_name': answer_owner.get('name') or answer_owner_metrics.get('DisplayName'),
-                    'reputation': answer_owner.get('reputation') or answer_owner_metrics.get('Reputation', 'Unknown'),
-                    'account_id': answer_owner.get('accountId') or answer_owner_metrics.get('Account_ID'),
-                    'role': answer_owner.get('role') or answer_owner_metrics.get('User_Type'),
-                    'title': answer_owner_metrics.get('Title'),
-                    'department': answer_owner_metrics.get('Department'),
-                    'is_sme': answer_owner_metrics.get('Is_SME', False),
-                    'sme_tags': answer_owner_metrics.get('Tags', []),
-                    'has_participated': answer_owner_metrics.get('Has_Participated', False)
-                }
-            }
-        
-        # Build question-centric data
-        question_data = {
-            # Question fields
-            'Question_ID': question_id,
-            'QuestionTitle': question.get('title'),
-            'QuestionTags': question_tags,
+            # Activity Metrics
+            'Total_Questions_Asked': len(user_questions),
+            'Total_Questions_No_Answers': unanswered_questions,
+            'Questions_With_Accepted_Answers': questions_with_accepted_answers,
+            'Total_Answers_Given': len(user_answers),
             
-            # User fields (from owner)
-            'owner': {
-                'DisplayName': owner_metrics.get('DisplayName'),
-                'Title': owner_metrics.get('Title'),
-                'Department': owner_metrics.get('Department'),
-                'Reputation': owner_metrics.get('Reputation', 'Unknown'),
-                'Account_Longevity_Days': owner_metrics.get('Account_Longevity', 'Unknown'),
-                'Total_Questions_Asked': owner_metrics.get('Total_Questions_Asked', 'Unknown'),
-                'Total_Questions_No_Answers': owner_metrics.get('Total_Questions_No_Answers', 'Unknown'),
-                'Total_Answers': owner_metrics.get('Total_Answers', 'Unknown'),
-                'Questions_With_Accepted_Answers': owner_metrics.get('Questions_With_Accepted_Answers', 'Unknown'),
-                'Articles': owner_metrics.get('Articles', 'Unknown'),
-                'Location': owner_metrics.get('Location'),
-                'Account_ID': owner_metrics.get('Account_ID'),
-                'User_ID': owner_metrics.get('User_ID'),
-                'Creation_Date': owner_metrics.get('Creation_Date'),
-                'Joined_UTC': owner_metrics.get('Joined_UTC'), 
-                'User_Type': owner_metrics.get('User_Type'),
-                'Is_SME': owner_metrics.get('Is_SME', False),
-                'Last_Login_Date': owner_metrics.get('Last_Login_Date'),
-                'Tags': owner_metrics.get('Tags', []),
-                'Has_Participated': owner_metrics.get('Has_Participated', False)
-            },
+            # SME Info
+            'Is_SME': is_sme,
+            'SME_Tags': sme_tags,
             
-            # Accepted Answer Data
-            'accepted_answer': accepted_answer_data,
+            # Questions Data
+            'Questions': processed_questions,
             
             # Metadata
-            'Question_Creation_Date': question.get('creationDate'),
-            'Question_Score': question.get('score', 'Unknown'),
-            'Question_View_Count': question.get('viewCount', 'Unknown'),
-            'Question_Answer_Count': question.get('answerCount', 'Unknown'),
-            'Question_Is_Answered': question.get('isAnswered', False),
             'Last_Updated': datetime.now().isoformat(),
             'Data_Collection_Timestamp': convert_epoch_to_utc_timestamp(datetime.now().timestamp())
         }
         
-        return question_data
+        return user_data
         
     except Exception as e:
-        log(f"Unexpected error in process_question_data for question {question.get('id') if question else 'None'}: {str(e)}")
+        log(f"Unexpected error in process_user_data for user {user.get('id') if user else 'None'}: {str(e)}")
         return None
 
 async def collect_powerbi_data() -> List[Dict]:
-    """Main async function to collect question-centric PowerBI data with ALL users"""
+    """Main async function to collect user-centric PowerBI data"""
     global RATE_LIMITER
     
     filter_message = ""
     if CONFIG.get('from_date') and CONFIG.get('to_date'):
-        filter_message = f" with date filter from {CONFIG['from_date']} to {CONFIG['to_date']}"
+        filter_message = f" created between {CONFIG['from_date']} and {CONFIG['to_date']}"
+    else:
+        filter_message = " (all users - no date filter applied)"
     
-    log(f"Starting question-centric PowerBI data collection with ALL users{filter_message}")
+    log(f"Starting user-centric PowerBI data collection{filter_message}")
     
     # Initialize rate limiter
     RATE_LIMITER = asyncio.Semaphore(BURST_LIMIT_REQUESTS)
@@ -960,93 +910,93 @@ async def collect_powerbi_data() -> List[Dict]:
     timeout = aiohttp.ClientTimeout(total=300)  # 5 minute timeout
     
     async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
-        # Step 1: Get ALL users from the instance (no date filtering)
+        # Step 1: Get users created in the specified timeframe
         stop_event = threading.Event()
-        loading_message = "Fetching ALL users from instance..."
+        loading_message = f"Fetching users{filter_message}..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
         
         if not VERBOSE:
             loading_thread.start()
         
         try:
-            all_users = await get_all_users(session)
+            users_in_timeframe = await get_users_created_in_timeframe(session)
         finally:
             stop_event.set()
             if not VERBOSE:
                 loading_thread.join()
-                print("\rAll users retrieval complete!        ")
+                print("\rUsers retrieval complete!        ")
         
-        if not all_users:
-            log("No users found")
+        if not users_in_timeframe:
+            log("No users found in the specified timeframe")
             return []
         
-        log(f"Retrieved {len(all_users)} total users from instance")
+        log(f"Retrieved {len(users_in_timeframe)} users{filter_message}")
         
-        # Step 2: Get all questions (with date filtering if configured)
+        # Step 2: Get all questions for each user
         stop_event = threading.Event()
-        loading_message = f"Fetching questions{filter_message}..."
+        loading_message = f"Fetching questions for {len(users_in_timeframe)} users..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
         
         if not VERBOSE:
             loading_thread.start()
         
         try:
-            all_questions = await get_all_questions(session)
+            all_user_questions = {}
+            all_questions = []
+            
+            # Create semaphore for concurrent user question requests
+            concurrent_limit = min(10, BURST_LIMIT_REQUESTS // 4)
+            semaphore = asyncio.Semaphore(concurrent_limit)
+            
+            async def fetch_questions_for_user(user):
+                async with semaphore:
+                    user_id = user.get('id')
+                    if not user_id:
+                        return
+                    
+                    try:
+                        questions = await get_questions_for_user(session, user_id)
+                        all_user_questions[user_id] = questions
+                        all_questions.extend(questions)
+                    except Exception as e:
+                        log(f"Error fetching questions for user {user_id}: {str(e)}")
+                        all_user_questions[user_id] = []
+            
+            # Process users in batches
+            batch_size = 20
+            for i in range(0, len(users_in_timeframe), batch_size):
+                batch = users_in_timeframe[i:i + batch_size]
+                tasks = [fetch_questions_for_user(user) for user in batch]
+                await asyncio.gather(*tasks, return_exceptions=True)
+                
+                log(f"Processed questions for batch {i//batch_size + 1}/{(len(users_in_timeframe) + batch_size - 1)//batch_size}")
+                await asyncio.sleep(0.5)  # Small delay between batches
+                
         finally:
             stop_event.set()
             if not VERBOSE:
                 loading_thread.join()
-                print("\rQuestion retrieval complete!        ")
+                print("\rQuestions retrieval complete!        ")
         
-        # Step 3: Get all answers for the questions (with date filtering if configured)
+        log(f"Retrieved {len(all_questions)} total questions from {len(users_in_timeframe)} users")
+        
+        # Step 3: Get all answers for the questions
         stop_event = threading.Event()
-        loading_message = f"Fetching answers for {len(all_questions)} questions{filter_message}..."
+        loading_message = f"Fetching answers for {len(all_questions)} questions..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
         
         if not VERBOSE:
             loading_thread.start()
         
         try:
-            all_answers = await get_all_answers_for_questions(session, all_questions)
+            all_answers = await get_answers_for_questions(session, all_questions)
         finally:
             stop_event.set()
             if not VERBOSE:
                 loading_thread.join()
                 print("\rAnswers retrieval complete!        ")
         
-        # Step 4: Get unanswered questions (with date filtering if configured)
-        stop_event = threading.Event()
-        loading_message = f"Fetching unanswered questions{filter_message}..."
-        loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
-        
-        if not VERBOSE:
-            loading_thread.start()
-        
-        try:
-            unanswered_questions = await get_unanswered_questions(session)
-        finally:
-            stop_event.set()
-            if not VERBOSE:
-                loading_thread.join()
-                print("\rUnanswered questions retrieval complete!        ")
-        
-        # Step 5: Get questions with accepted answers (with date filtering if configured)
-        stop_event = threading.Event()
-        loading_message = f"Fetching questions with accepted answers{filter_message}..."
-        loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
-        
-        if not VERBOSE:
-            loading_thread.start()
-        
-        try:
-            accepted_answer_questions = await get_questions_with_accepted_answers(session)
-        finally:
-            stop_event.set()
-            if not VERBOSE:
-                loading_thread.join()
-                print("\rAccepted answer questions retrieval complete!        ")
-        
-        # Step 6: Extract accepted answers from the answers we already collected
+        # Step 4: Extract accepted answers
         stop_event = threading.Event()
         loading_message = f"Extracting accepted answers from {len(all_answers)} answers..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
@@ -1062,65 +1012,33 @@ async def collect_powerbi_data() -> List[Dict]:
                 loading_thread.join()
                 print("\rAccepted answers extraction complete!        ")
         
-        # Step 7: Get all articles (with date filtering if configured)
+        # Step 5: Get detailed user info for all users
+        user_ids = [user.get('id') for user in users_in_timeframe if user.get('id')]
+        
         stop_event = threading.Event()
-        loading_message = f"Fetching articles{filter_message}..."
+        loading_message = f"Fetching detailed info for {len(user_ids)} users..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
         
         if not VERBOSE:
             loading_thread.start()
         
         try:
-            all_articles = await get_all_articles(session)
-        finally:
-            stop_event.set()
-            if not VERBOSE:
-                loading_thread.join()
-                print("\rArticle retrieval complete!        ")
-        
-        # Step 8: Determine which users participated during the filtered period
-        participated_user_ids = set()
-        
-        # Add users who created questions during the period
-        participated_user_ids.update(extract_user_ids_from_questions(all_questions))
-        
-        # Add users who created answers during the period
-        participated_user_ids.update(extract_user_ids_from_answers(all_answers))
-        
-        # Add users who created articles during the period
-        participated_user_ids.update(extract_user_ids_from_articles(all_articles))
-        
-        # Add users who created accepted answers during the period
-        participated_user_ids.update(extract_user_ids_from_accepted_answers(accepted_answers))
-        
-        log(f"Found {len(participated_user_ids)} users who participated during the filtered period")
-        
-        # Step 9: Get detailed user info for ALL users
-        all_user_ids = [user.get('id') for user in all_users if user.get('id')]
-        
-        stop_event = threading.Event()
-        loading_message = f"Fetching detailed info for {len(all_user_ids)} users..."
-        loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
-        
-        if not VERBOSE:
-            loading_thread.start()
-        
-        try:
-            user_details = await get_user_detailed_info_batch(session, all_user_ids)
+            user_details = await get_user_detailed_info_batch(session, user_ids)
         finally:
             stop_event.set()
             if not VERBOSE:
                 loading_thread.join()
                 print("\rUser details retrieval complete!        ")
         
-        # Step 10: Get SME data for all tags
+        # Step 6: Get SME data for all tags
         all_tag_ids = set()
-        for question in all_questions:
-            for tag in question.get('tags', []):
-                if isinstance(tag, dict) and tag.get('id'):
-                    all_tag_ids.add(tag.get('id'))
-                    # Cache tag name for later use
-                    SME_CACHE[tag.get('id')] = tag.get('name', f"tag_{tag.get('id')}")
+        for questions in all_user_questions.values():
+            for question in questions:
+                for tag in question.get('tags', []):
+                    if isinstance(tag, dict) and tag.get('id'):
+                        all_tag_ids.add(tag.get('id'))
+                        # Cache tag name for later use
+                        SME_CACHE[tag.get('id')] = tag.get('name', f"tag_{tag.get('id')}")
         
         stop_event = threading.Event()
         loading_message = f"Fetching SME data for {len(all_tag_ids)} tags..."
@@ -1130,48 +1048,60 @@ async def collect_powerbi_data() -> List[Dict]:
             loading_thread.start()
         
         try:
-            all_sme_data = await get_sme_data_for_tags(session, list(all_tag_ids))
+            all_sme_data = await get_sme_data_for_tags(session, list(all_tag_ids)) if all_tag_ids else {}
         finally:
             stop_event.set()
             if not VERBOSE:
                 loading_thread.join()
                 print("\rSME data retrieval complete!        ")
         
-        log(f"Content summary: {len(all_questions)} questions, {len(all_answers)} answers, {len(all_users)} users, {len(all_articles)} articles, {len(accepted_answers)} accepted answers")
-        log(f"Participation summary: {len(participated_user_ids)} users participated during filtered period")
+        # Step 7: Group answers by user
+        answers_by_user = defaultdict(list)
+        for answer in all_answers:
+            owner = answer.get('owner')
+            if owner and owner.get('id'):
+                answers_by_user[owner.get('id')].append(answer)
         
-        # Step 11: Build user metrics for ALL users with participation flag
-        log("Building comprehensive user metrics for ALL users...")
-        user_metrics = build_user_metrics_from_all_users(
-            all_users, all_questions, unanswered_questions, accepted_answer_questions,
-            all_articles, all_answers, user_details, all_sme_data, participated_user_ids
-        )
+        log(f"Content summary: {len(users_in_timeframe)} users, {len(all_questions)} questions, {len(all_answers)} answers, {len(accepted_answers)} accepted answers")
         
-        # Step 12: Process all questions into question-centric format
-        log(f"Processing {len(all_questions)} questions")
+        # Step 8: Process all users into user-centric format
+        log(f"Processing {len(users_in_timeframe)} users")
         
         powerbi_data = []
-        for i, question in enumerate(all_questions, 1):
+        for i, user in enumerate(users_in_timeframe, 1):
             try:
-                question_data = process_question_data(question, user_metrics, accepted_answers)
-                if question_data:
-                    powerbi_data.append(question_data)
+                user_id = user.get('id')
+                if not user_id:
+                    continue
+                
+                user_questions = all_user_questions.get(user_id, [])
+                user_answers = answers_by_user.get(user_id, [])
+                
+                user_data = process_user_data(
+                    user, user_details, user_questions, user_answers,
+                    accepted_answers, all_sme_data
+                )
+                
+                if user_data:
+                    powerbi_data.append(user_data)
                     
-                if i % 100 == 0 or i == len(all_questions):
-                    log(f"Processed {i}/{len(all_questions)} questions")
+                if i % 50 == 0 or i == len(users_in_timeframe):
+                    log(f"Processed {i}/{len(users_in_timeframe)} users")
                     
             except Exception as e:
-                log(f"Error processing question {question.get('id')}: {str(e)}")
+                log(f"Error processing user {user.get('id')}: {str(e)}")
         
-        log(f"Collected question-centric data for {len(powerbi_data)} questions")
-        log(f"User metrics available for {len(user_metrics)} users")
+        log(f"Collected user-centric data for {len(powerbi_data)} users")
         
         return powerbi_data
 
 def save_data_to_json(data: List[Dict], filename: str = None):
     """Save collected data to JSON file"""
     if not filename:
-        filename = f"powerbi_questions_data.json"
+        if CONFIG.get('from_date') and CONFIG.get('to_date'):
+            filename = f"powerbi_users_{CONFIG['from_date']}_to_{CONFIG['to_date']}.json"
+        else:
+            filename = f"powerbi_users_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     
     try:
         with open(filename, 'w', encoding='utf-8') as f:
@@ -1194,11 +1124,13 @@ async def export_powerbi_data():
     filter_message = ""
     if CONFIG.get('filter_type'):
         if CONFIG['filter_type'] == "custom":
-            filter_message = f" for custom date range (from {CONFIG['from_date']} to {CONFIG['to_date']})"
+            filter_message = f" for users created in custom date range (from {CONFIG['from_date']} to {CONFIG['to_date']})"
+        elif CONFIG['filter_type'] != "none":
+            filter_message = f" for users created in the last {CONFIG['filter_type']} (from {CONFIG['from_date']} to {CONFIG['to_date']})"
         else:
-            filter_message = f" for the last {CONFIG['filter_type']} (from {CONFIG['from_date']} to {CONFIG['to_date']})"
+            filter_message = " for all users (no date filter)"
     
-    log(f"Question-centric PowerBI data export with ALL users started at {start_time}{filter_message}")
+    log(f"User-centric PowerBI data export started at {start_time}{filter_message}")
     
     # Reset counters
     API_V2_CALLS = 0
@@ -1214,22 +1146,25 @@ async def export_powerbi_data():
         
         # Save to JSON file
         filename = CONFIG.get('output_file')
-        
-        save_data_to_json(powerbi_data, filename)
+        filename = save_data_to_json(powerbi_data, filename)
         
         end_time = datetime.now()
         duration = end_time - start_time
         
+        # Calculate totals
+        total_questions = sum(len(user_data.get('Questions', [])) for user_data in powerbi_data)
+        
         # Print summary
-        print(f"\n✅ Question-centric PowerBI data export with ALL users complete!")
+        print(f"\n✅ User-centric PowerBI data export complete!")
         print(f"   Data saved to: {filename}")
-        print(f"   Total questions processed{filter_message}: {len(powerbi_data)}")
+        print(f"   Total users processed{filter_message}: {len(powerbi_data)}")
+        print(f"   Total questions collected: {total_questions}")
         print(f"   Total time: {duration}")
         print(f"   Total API v3 calls: {API_V3_CALLS}")
         print(f"   Total API v2.3 calls: {API_V2_CALLS}")
         print(f"   Total API calls: {API_V3_CALLS + API_V2_CALLS}")
         if len(powerbi_data) > 0:
-            print(f"   Average time per question: {duration.total_seconds() / len(powerbi_data):.3f}s")
+            print(f"   Average time per user: {duration.total_seconds() / len(powerbi_data):.3f}s")
         
         log(f"Export completed successfully in {duration}")
         
@@ -1242,7 +1177,7 @@ def run_cron_job():
     if not RUNNING:
         return
         
-    log("Running scheduled question-centric PowerBI data collection with ALL users")
+    log("Running scheduled user-centric PowerBI data collection")
     asyncio.run(export_powerbi_data())
 
 def main():
@@ -1250,7 +1185,7 @@ def main():
     
     # Setup argument parser
     parser = argparse.ArgumentParser(
-        description="Universal Async Question-Centric PowerBI Data Collector for Stack Overflow Enterprise & Teams with Time Filtering and ALL Users"
+        description="Universal Async User-Centric PowerBI Data Collector for Stack Overflow Enterprise & Teams with Time Filtering"
     )
     parser.add_argument("--base-url", required=True, 
                        help="Stack Overflow Enterprise or Teams Base URL")
@@ -1270,7 +1205,7 @@ def main():
     # Time filtering options
     parser.add_argument("--filter", choices=["week", "month", "quarter", "year", "custom", "none"], 
                        default="none", 
-                       help="Time filter for data collection (last week, month, quarter, year, custom dates, or none for all data)")
+                       help="Time filter for user creation date (last week, month, quarter, year, custom dates, or none for all users)")
     parser.add_argument("--from-date", 
                        help="Start date for custom filter (format: YYYY-MM-DD)")
     parser.add_argument("--to-date", 
@@ -1299,7 +1234,7 @@ def main():
     elif args.filter == "none":
         from_date = None
         to_date = None
-        filter_type = None
+        filter_type = "none"
     else:
         from_date, to_date = get_date_range(args.filter)
         filter_type = args.filter
@@ -1326,19 +1261,19 @@ def main():
     })
     
     # Create filter description for logging
-    filter_desc = "all data"
-    if filter_type:
+    filter_desc = "all users"
+    if filter_type and filter_type != "none":
         if filter_type == "custom":
-            filter_desc = f"custom date range ({from_date} to {to_date})"
+            filter_desc = f"users created in custom date range ({from_date} to {to_date})"
         else:
-            filter_desc = f"last {filter_type} ({from_date} to {to_date})"
+            filter_desc = f"users created in the last {filter_type} ({from_date} to {to_date})"
     
-    logger.info(f"Universal Async Question-Centric PowerBI Data Collector with ALL Users starting...")
+    logger.info(f"Universal Async User-Centric PowerBI Data Collector starting...")
     logger.info(f"Instance type: {instance_type.title()}")
     logger.info(f"API v3 Base URL: {CONFIG['api_v3_base']}")
     logger.info(f"API v2.3 Base URL: {CONFIG['api_v2_base']}")
     logger.info(f"Data collection scope: {filter_desc}")
-    logger.info(f"User data collection: ALL users from instance with participation flag")
+    logger.info(f"Data structure: User-centric with all questions per user")
     if CONFIG.get('output_file'):
         logger.info(f"Output file: {CONFIG['output_file']}")
     else:
@@ -1375,7 +1310,7 @@ def main():
             schedule.run_pending()
             time.sleep(60)  # Check every minute
     
-    logger.info("Universal Async Question-Centric PowerBI Data Collector with ALL Users stopped")
+    logger.info("Universal Async User-Centric PowerBI Data Collector stopped")
 
 if __name__ == "__main__":
     main()
