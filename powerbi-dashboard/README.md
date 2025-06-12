@@ -13,48 +13,175 @@ A comprehensive Python tool for collecting user-centric data from Stack Overflow
 - **Persistent Retry Logic**: Never gives up on rate-limited requests (429 errors)
 - **Scheduled Collection**: Built-in cron job functionality for automated data collection
 
+## Comprehensive User Metrics Collected
+
+The collector captures detailed analytics for each user across multiple dimensions:
+
+### User Profile Information
+- **User_ID**: Unique user identifier
+- **DisplayName**: User's display name
+- **Account_ID**: Account identifier
+- **Title**: Job title/position
+- **Department**: User's department
+- **Location**: Geographic location
+- **User_Type**: User role (registered, moderator, etc.)
+
+### Account & Engagement Metrics
+- **Reputation**: Current reputation score
+- **Account_Longevity_Days**: Days since account creation
+- **Creation_Date**: Account creation timestamp (UTC)
+- **Joined_UTC**: Account join date in UTC format
+- **Last_Login_Date**: Most recent login timestamp
+
+### Question Activity Analytics
+- **Total_Questions_Asked**: Number of questions posted
+- **Total_Questions_Score**: Cumulative score across all questions
+- **Total_Questions_No_Answers**: Count of unanswered questions
+- **Questions_With_Accepted_Answers**: Questions that received accepted answers
+
+### Answer Activity Analytics
+- **Total_Answers_Given**: Number of answers provided
+- **Accepted_Answers_Given**: Count of answers marked as accepted
+- **Total_Answer_Score**: Cumulative score across all answers
+
+### Article/Content Analytics
+- **Total_Articles_Written**: Number of articles authored
+- **Total_Article_Views**: Total views across all articles
+- **Total_Article_Score**: Cumulative score across all articles
+
+### Subject Matter Expertise
+- **Is_SME**: Boolean indicating SME status
+- **SME_Tags**: List of tags where user is recognized as SME
+
+### Detailed Content Arrays
+- **Questions**: Complete question data with metadata
+- **Articles**: Full article information and statistics
+- **Answers**: Comprehensive answer data and engagement metrics
+
+### System Metadata
+- **Last_Updated**: Data collection completion timestamp
+- **Data_Collection_Timestamp**: UTC timestamp of collection run
+
 ## Data Structure
 
-The collector generates user-centric JSON data with the following structure:
+The collector generates user-centric JSON data with the following comprehensive structure:
 
 ```json
 {
+  // User Basic Information
   "User_ID": 123,
   "DisplayName": "John Doe",
   "Account_ID": 456,
+  "Title": "Senior Developer",
+  "Department": "Engineering",
+  "Location": "New York, NY",
+  "User_Type": "registered",
+  
+  // User Metrics & Reputation
   "Reputation": 1250,
+  "Account_Longevity_Days": 365,
+  "Creation_Date": "2023-01-15T09:30:15.123",
+  "Joined_UTC": "2023-01-15T09:30:15.123",
+  "Last_Login_Date": "2024-12-03T14:22:33.456",
+  
+  // Question Activity Metrics
   "Total_Questions_Asked": 15,
+  "Total_Questions_Score": 87,
+  "Total_Questions_No_Answers": 3,
+  "Questions_With_Accepted_Answers": 8,
+  
+  // Answer Activity Metrics
   "Total_Answers_Given": 32,
+  "Accepted_Answers_Given": 12,
+  "Total_Answer_Score": 156,
+  
+  // Article Activity Metrics
   "Total_Articles_Written": 5,
+  "Total_Article_Views": 1234,
+  "Total_Article_Score": 89,
+  
+  // Subject Matter Expert Information
   "Is_SME": true,
-  "SME_Tags": ["python", "javascript"],
+  "SME_Tags": ["python", "javascript", "react"],
+  
+  // Detailed Questions Data
   "Questions": [
     {
       "question_id": 789,
       "title": "How to implement async in Python?",
       "tags": ["python", "async"],
+      "creation_date": 1672531200,
       "score": 5,
+      "view_count": 123,
+      "answer_count": 3,
+      "is_answered": true,
       "has_accepted_answer": true,
-      "accepted_answer": { /* answer details */ }
+      "accepted_answer": {
+        "answer_id": 890,
+        "creation_date": 1672534800,
+        "score": 8,
+        "owner": {
+          "id": 456,
+          "display_name": "Jane Smith",
+          "reputation": 2500,
+          "account_id": 789,
+          "role": "moderator"
+        }
+      }
     }
   ],
+  
+  // Detailed Articles Data
   "Articles": [
     {
       "article_id": 101,
-      "title": "Best Practices for Code Review",
       "type": "knowledge-article",
+      "title": "Best Practices for Code Review",
+      "tags": ["code-review", "best-practices"],
+      "creation_date": 1672617600,
+      "last_activity_date": 1672704000,
       "score": 12,
-      "view_count": 234
+      "view_count": 234,
+      "web_url": "https://...",
+      "share_url": "https://...",
+      "is_deleted": false,
+      "is_obsolete": false,
+      "is_closed": false,
+      "owner": { /* owner details */ },
+      "last_editor": { /* editor details */ }
     }
   ],
+  
+  // Detailed Answers Data
   "Answers": [
     {
       "answer_id": 555,
       "question_id": 333,
       "score": 8,
-      "is_accepted": true
+      "is_accepted": true,
+      "is_deleted": false,
+      "is_bookmarked": false,
+      "is_followed": false,
+      "creation_date": 1672704000,
+      "locked_date": null,
+      "last_edit_date": 1672790400,
+      "last_activity_date": 1672790400,
+      "deletion_date": null,
+      "comment_count": 2,
+      "web_url": "https://...",
+      "share_link": "https://...",
+      "user_can_follow": true,
+      "can_be_followed": true,
+      "is_subject_matter_expert": false,
+      "owner": { /* owner details */ },
+      "last_editor": { /* editor details */ },
+      "last_activity_user": { /* user details */ }
     }
-  ]
+  ],
+  
+  // Metadata
+  "Last_Updated": "2024-12-03T15:30:45.123456",
+  "Data_Collection_Timestamp": "2024-12-03T15:30:45.123"
 }
 ```
 
