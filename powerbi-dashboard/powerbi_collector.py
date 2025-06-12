@@ -973,7 +973,7 @@ def process_user_data(user: Dict, user_details: Dict, user_questions: List[Dict]
                 }
             
             # Get answers for this question (raw format - these are answers BY this user TO other questions)
-            question_answers = [answer for answer in user_answers if answer.get('questionId') == question_id]
+            # question_answers = [answer for answer in user_answers if answer.get('questionId') == question_id]
             
             question_data = {
                 'question_id': question_id,
@@ -986,7 +986,7 @@ def process_user_data(user: Dict, user_details: Dict, user_questions: List[Dict]
                 'is_answered': question.get('isAnswered', "Not retrieved"),
                 'has_accepted_answer': bool(accepted_answer_data),
                 'accepted_answer': accepted_answer_data,
-                'answers': question_answers  # These are answers TO this question BY this user
+                # 'answers': question_answers  # These are answers TO this question BY this user
             }
             processed_questions.append(question_data)
         
@@ -1005,6 +1005,7 @@ def process_user_data(user: Dict, user_details: Dict, user_questions: List[Dict]
         total_article_score = sum(article.get('score', 0) for article in processed_articles)
         
         # Calculate answer metrics
+        total_question_score = sum(question.get('score', 0) for question in user_questions)
         total_answer_score = sum(answer.get('score', 0) for answer in processed_answers)
         accepted_answers_given = len([answer for answer in processed_answers if answer.get('is_accepted', False)])
         
@@ -1028,6 +1029,7 @@ def process_user_data(user: Dict, user_details: Dict, user_questions: List[Dict]
             
             # Activity Metrics
             'Total_Questions_Asked': len(user_questions),
+            'Total_Questions_Score': total_question_score, 
             'Total_Questions_No_Answers': unanswered_questions,
             'Questions_With_Accepted_Answers': questions_with_accepted_answers,
             'Total_Answers_Given': len(processed_answers),
