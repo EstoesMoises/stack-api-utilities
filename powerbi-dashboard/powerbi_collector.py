@@ -558,6 +558,7 @@ async def get_users_created_in_timeframe(session: aiohttp.ClientSession) -> List
     
     log(f"Final user count after filtering: {len(all_users)}")
     return all_users
+
 async def get_questions_for_user(session: aiohttp.ClientSession, user_id: int) -> List[Dict]:
     """Get all questions for a specific user using authorId parameter"""
     all_questions = []
@@ -588,6 +589,37 @@ async def get_questions_for_user(session: aiohttp.ClientSession, user_id: int) -
         
     log(f"Retrieved {len(all_questions)} questions for user {user_id}")
     return all_questions
+
+async def get_articles_for_user(session: aiohttp.ClientSession, user_id: int) -> List[Dict]:
+    """Get all articles for a specific user using authorId parameter"""
+    all_articles = []
+    page = 1
+    total_pages = None
+    
+    log(f"Fetching articles for user {user_id}")
+    
+    while True:
+        params = {'page': page, 'pageSize': 100, 'authorId': user_id}
+        
+        url = f"{CONFIG['api_v3_base']}/articles"
+        
+        data = await make_api_request(session, url, params)
+        if not data:
+            break
+            
+        articles = data.get("items", [])
+        all_articles.extend(articles)
+        
+        if total_pages is None:
+            total_pages = data.get("totalPages", 1)
+        
+        if page >= total_pages:
+            break
+        
+        page += 1
+        
+    log(f"Retrieved {len(all_articles)} articles for user {user_id}")
+    return all_articles
 
 async def get_answers_for_questions(session: aiohttp.ClientSession, questions: List[Dict]) -> List[Dict]:
     """Get all answers for the given questions"""
@@ -767,10 +799,124 @@ def extract_accepted_answers_from_all_answers(all_answers: List[Dict]) -> Dict[i
     log(f"Extracted {len(accepted_answers)} accepted answers from answers collection")
     return accepted_answers
 
+def process_answers_data(user_answers: List[Dict]) -> List[Dict]:
+    """Process answers data into a clean format"""
+    processed_answers = []
+    
+    for answer in user_answers:
+        # Get owner information
+        owner = answer.get('owner', {})
+        last_editor = answer.get('lastEditor', {})
+        last_activity_user = answer.get('lastActivityUser', {})
+        
+        answer_data = {
+            'answer_id': answer.get('id'),
+            'question_id': answer.get('questionId'),
+            'score': answer.get('score', 0),
+            'is_accepted': answer.get('isAccepted', False),
+            'is_deleted': answer.get('isDeleted', False),
+            'is_bookmarked': answer.get('isBookmarked', False),
+            'is_followed': answer.get('isFollowed', False),
+            'creation_date': answer.get('creationDate'),
+            'locked_date': answer.get('lockedDate'),
+            'last_edit_date': answer.get('lastEditDate'),
+            'last_activity_date': answer.get('lastActivityDate'),
+            'deletion_date': answer.get('deletionDate'),
+            'comment_count': answer.get('commentCount', 0),
+            'web_url': answer.get('webUrl'),
+            'share_link': answer.get('shareLink'),
+            'user_can_follow': answer.get('userCanFollow', False),
+            'can_be_followed': answer.get('canBeFollowed', False),
+            'is_subject_matter_expert': answer.get('isSubjectMatterExpert', False),
+            'owner': {
+                'id': owner.get('id'),
+                'account_id': owner.get('accountId'),
+                'name': owner.get('name'),
+                'avatar_url': owner.get('avatarUrl'),
+                'web_url': owner.get('webUrl'),
+                'reputation': owner.get('reputation'),
+                'role': owner.get('role')
+            },
+            'last_editor': {
+                'id': last_editor.get('id'),
+                'account_id': last_editor.get('accountId'),
+                'name': last_editor.get('name'),
+                'avatar_url': last_editor.get('avatarUrl'),
+                'web_url': last_editor.get('webUrl'),
+                'reputation': last_editor.get('reputation'),
+                'role': last_editor.get('role')
+            } if last_editor else None,
+            'last_activity_user': {
+                'id': last_activity_user.get('id'),
+                'account_id': last_activity_user.get('accountId'),
+                'name': last_activity_user.get('name'),
+                'avatar_url': last_activity_user.get('avatarUrl'),
+                'web_url': last_activity_user.get('webUrl'),
+                'reputation': last_activity_user.get('reputation'),
+                'role': last_activity_user.get('role')
+            } if last_activity_user else None
+        }
+        processed_answers.append(answer_data)
+    
+    return processed_answers
+def process_articles_data(user_articles: List[Dict]) -> List[Dict]:
+    """Process articles data into a clean format"""
+    processed_articles = []
+    
+    for article in user_articles:
+        # Get article tags
+        article_tags = []
+        for tag in article.get('tags', []):
+            if isinstance(tag, dict):
+                article_tags.append(tag.get('name', ''))
+            else:
+                article_tags.append(str(tag))
+        
+        # Get owner information
+        owner = article.get('owner', {})
+        last_editor = article.get('lastEditor', {})
+        
+        article_data = {
+            'article_id': article.get('id'),
+            'type': article.get('type'),
+            'title': article.get('title'),
+            'tags': article_tags,
+            'creation_date': article.get('creationDate'),
+            'last_activity_date': article.get('lastActivityDate'),
+            'score': article.get('score', 0),
+            'view_count': article.get('viewCount', 0),
+            'web_url': article.get('webUrl'),
+            'share_url': article.get('shareUrl'),
+            'is_deleted': article.get('isDeleted', False),
+            'is_obsolete': article.get('isObsolete', False),
+            'is_closed': article.get('isClosed', False),
+            'owner': {
+                'id': owner.get('id'),
+                'account_id': owner.get('accountId'),
+                'name': owner.get('name'),
+                'avatar_url': owner.get('avatarUrl'),
+                'web_url': owner.get('webUrl'),
+                'reputation': owner.get('reputation'),
+                'role': owner.get('role')
+            },
+            'last_editor': {
+                'id': last_editor.get('id'),
+                'account_id': last_editor.get('accountId'),
+                'name': last_editor.get('name'),
+                'avatar_url': last_editor.get('avatarUrl'),
+                'web_url': last_editor.get('webUrl'),
+                'reputation': last_editor.get('reputation'),
+                'role': last_editor.get('role')
+            } if last_editor else None
+        }
+        processed_articles.append(article_data)
+    
+    return processed_articles
+
 def process_user_data(user: Dict, user_details: Dict, user_questions: List[Dict], 
-                     user_answers: List[Dict], accepted_answers: Dict[int, Dict], 
-                     all_sme_data: Dict[int, List[int]]) -> Dict:
-    """Process a single user into user-centric format with all their questions"""
+                     user_answers: List[Dict], user_articles: List[Dict], 
+                     accepted_answers: Dict[int, Dict], all_sme_data: Dict[int, List[int]]) -> Dict:
+    """Process a single user into user-centric format with all their questions, answers, and articles"""
     try:
         if not user:
             return None
@@ -826,7 +972,7 @@ def process_user_data(user: Dict, user_details: Dict, user_questions: List[Dict]
                     }
                 }
             
-            # Get answers for this question
+            # Get answers for this question (raw format - these are answers BY this user TO other questions)
             question_answers = [answer for answer in user_answers if answer.get('questionId') == question_id]
             
             question_data = {
@@ -840,13 +986,27 @@ def process_user_data(user: Dict, user_details: Dict, user_questions: List[Dict]
                 'is_answered': question.get('isAnswered', "Not retrieved"),
                 'has_accepted_answer': bool(accepted_answer_data),
                 'accepted_answer': accepted_answer_data,
-                'answers': question_answers
+                'answers': question_answers  # These are answers TO this question BY this user
             }
             processed_questions.append(question_data)
+        
+        # Process user's articles
+        processed_articles = process_articles_data(user_articles)
+        
+        # Process user's answers (all answers BY this user)
+        processed_answers = process_answers_data(user_answers)
         
         # Calculate user metrics
         questions_with_accepted_answers = len([q for q in user_questions if q.get('hasAcceptedAnswer', False)])
         unanswered_questions = len([q for q in user_questions if not q.get('isAnswered', False)])
+        
+        # Calculate article metrics
+        total_article_views = sum(article.get('view_count', 0) for article in processed_articles)
+        total_article_score = sum(article.get('score', 0) for article in processed_articles)
+        
+        # Calculate answer metrics
+        total_answer_score = sum(answer.get('score', 0) for answer in processed_answers)
+        accepted_answers_given = len([answer for answer in processed_answers if answer.get('is_accepted', False)])
         
         # Build user-centric data
         user_data = {
@@ -870,7 +1030,14 @@ def process_user_data(user: Dict, user_details: Dict, user_questions: List[Dict]
             'Total_Questions_Asked': len(user_questions),
             'Total_Questions_No_Answers': unanswered_questions,
             'Questions_With_Accepted_Answers': questions_with_accepted_answers,
-            'Total_Answers_Given': len(user_answers),
+            'Total_Answers_Given': len(processed_answers),
+            'Accepted_Answers_Given': accepted_answers_given,
+            'Total_Answer_Score': total_answer_score,
+            
+            # Article Metrics
+            'Total_Articles_Written': len(processed_articles),
+            'Total_Article_Views': total_article_views,
+            'Total_Article_Score': total_article_score,
             
             # SME Info
             'Is_SME': is_sme,
@@ -878,6 +1045,12 @@ def process_user_data(user: Dict, user_details: Dict, user_questions: List[Dict]
             
             # Questions Data
             'Questions': processed_questions,
+            
+            # Articles Data
+            'Articles': processed_articles,
+            
+            # Answers Data (all answers given BY this user)
+            'Answers': processed_answers,
             
             # Metadata
             'Last_Updated': datetime.now().isoformat(),
@@ -891,7 +1064,7 @@ def process_user_data(user: Dict, user_details: Dict, user_questions: List[Dict]
         return None
 
 async def collect_powerbi_data() -> List[Dict]:
-    """Main async function to collect user-centric PowerBI data"""
+    """Main async function to collect user-centric PowerBI data including articles"""
     global RATE_LIMITER
     
     filter_message = ""
@@ -900,7 +1073,7 @@ async def collect_powerbi_data() -> List[Dict]:
     else:
         filter_message = " (all users - no date filter applied)"
     
-    log(f"Starting user-centric PowerBI data collection{filter_message}")
+    log(f"Starting user-centric PowerBI data collection with articles{filter_message}")
     
     # Initialize rate limiter
     RATE_LIMITER = asyncio.Semaphore(BURST_LIMIT_REQUESTS)
@@ -980,7 +1153,50 @@ async def collect_powerbi_data() -> List[Dict]:
         
         log(f"Retrieved {len(all_questions)} total questions from {len(users_in_timeframe)} users")
         
-        # Step 3: Get all answers for the questions
+        # Step 3: Get all articles for each user
+        stop_event = threading.Event()
+        loading_message = f"Fetching articles for {len(users_in_timeframe)} users..."
+        loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
+        
+        if not VERBOSE:
+            loading_thread.start()
+        
+        try:
+            all_user_articles = {}
+            all_articles = []
+            
+            async def fetch_articles_for_user(user):
+                async with semaphore:
+                    user_id = user.get('id')
+                    if not user_id:
+                        return
+                    
+                    try:
+                        articles = await get_articles_for_user(session, user_id)
+                        all_user_articles[user_id] = articles
+                        all_articles.extend(articles)
+                    except Exception as e:
+                        log(f"Error fetching articles for user {user_id}: {str(e)}")
+                        all_user_articles[user_id] = []
+            
+            # Process users in batches
+            for i in range(0, len(users_in_timeframe), batch_size):
+                batch = users_in_timeframe[i:i + batch_size]
+                tasks = [fetch_articles_for_user(user) for user in batch]
+                await asyncio.gather(*tasks, return_exceptions=True)
+                
+                log(f"Processed articles for batch {i//batch_size + 1}/{(len(users_in_timeframe) + batch_size - 1)//batch_size}")
+                await asyncio.sleep(0.5)  # Small delay between batches
+                
+        finally:
+            stop_event.set()
+            if not VERBOSE:
+                loading_thread.join()
+                print("\rArticles retrieval complete!        ")
+        
+        log(f"Retrieved {len(all_articles)} total articles from {len(users_in_timeframe)} users")
+        
+        # Step 4: Get all answers for the questions
         stop_event = threading.Event()
         loading_message = f"Fetching answers for {len(all_questions)} questions..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
@@ -996,7 +1212,7 @@ async def collect_powerbi_data() -> List[Dict]:
                 loading_thread.join()
                 print("\rAnswers retrieval complete!        ")
         
-        # Step 4: Extract accepted answers
+        # Step 5: Extract accepted answers
         stop_event = threading.Event()
         loading_message = f"Extracting accepted answers from {len(all_answers)} answers..."
         loading_thread = threading.Thread(target=loading_animation, args=(stop_event, loading_message))
@@ -1012,7 +1228,7 @@ async def collect_powerbi_data() -> List[Dict]:
                 loading_thread.join()
                 print("\rAccepted answers extraction complete!        ")
         
-        # Step 5: Get detailed user info for all users
+        # Step 6: Get detailed user info for all users
         user_ids = [user.get('id') for user in users_in_timeframe if user.get('id')]
         
         stop_event = threading.Event()
@@ -1030,11 +1246,22 @@ async def collect_powerbi_data() -> List[Dict]:
                 loading_thread.join()
                 print("\rUser details retrieval complete!        ")
         
-        # Step 6: Get SME data for all tags
+        # Step 7: Get SME data for all tags (from both questions and articles)
         all_tag_ids = set()
+        
+        # Get tags from questions
         for questions in all_user_questions.values():
             for question in questions:
                 for tag in question.get('tags', []):
+                    if isinstance(tag, dict) and tag.get('id'):
+                        all_tag_ids.add(tag.get('id'))
+                        # Cache tag name for later use
+                        SME_CACHE[tag.get('id')] = tag.get('name', f"tag_{tag.get('id')}")
+        
+        # Get tags from articles
+        for articles in all_user_articles.values():
+            for article in articles:
+                for tag in article.get('tags', []):
                     if isinstance(tag, dict) and tag.get('id'):
                         all_tag_ids.add(tag.get('id'))
                         # Cache tag name for later use
@@ -1055,16 +1282,16 @@ async def collect_powerbi_data() -> List[Dict]:
                 loading_thread.join()
                 print("\rSME data retrieval complete!        ")
         
-        # Step 7: Group answers by user
+        # Step 8: Group answers by user
         answers_by_user = defaultdict(list)
         for answer in all_answers:
             owner = answer.get('owner')
             if owner and owner.get('id'):
                 answers_by_user[owner.get('id')].append(answer)
         
-        log(f"Content summary: {len(users_in_timeframe)} users, {len(all_questions)} questions, {len(all_answers)} answers, {len(accepted_answers)} accepted answers")
+        log(f"Content summary: {len(users_in_timeframe)} users, {len(all_questions)} questions, {len(all_articles)} articles, {len(all_answers)} answers, {len(accepted_answers)} accepted answers")
         
-        # Step 8: Process all users into user-centric format
+        # Step 9: Process all users into user-centric format
         log(f"Processing {len(users_in_timeframe)} users")
         
         powerbi_data = []
@@ -1075,10 +1302,11 @@ async def collect_powerbi_data() -> List[Dict]:
                     continue
                 
                 user_questions = all_user_questions.get(user_id, [])
+                user_articles = all_user_articles.get(user_id, [])
                 user_answers = answers_by_user.get(user_id, [])
                 
                 user_data = process_user_data(
-                    user, user_details, user_questions, user_answers,
+                    user, user_details, user_questions, user_answers, user_articles,
                     accepted_answers, all_sme_data
                 )
                 
@@ -1099,9 +1327,9 @@ def save_data_to_json(data: List[Dict], filename: str = None):
     """Save collected data to JSON file"""
     if not filename:
         if CONFIG.get('from_date') and CONFIG.get('to_date'):
-            filename = f"powerbi_users_{CONFIG['from_date']}_to_{CONFIG['to_date']}.json"
+            filename = f"powerbi_users_with_articles_{CONFIG['from_date']}_to_{CONFIG['to_date']}.json"
         else:
-            filename = f"powerbi_users_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+            filename = f"powerbi_users_with_articles_all_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     
     try:
         with open(filename, 'w', encoding='utf-8') as f:
@@ -1130,7 +1358,7 @@ async def export_powerbi_data():
         else:
             filter_message = " for all users (no date filter)"
     
-    log(f"User-centric PowerBI data export started at {start_time}{filter_message}")
+    log(f"User-centric PowerBI data export with articles started at {start_time}{filter_message}")
     
     # Reset counters
     API_V2_CALLS = 0
@@ -1153,12 +1381,14 @@ async def export_powerbi_data():
         
         # Calculate totals
         total_questions = sum(len(user_data.get('Questions', [])) for user_data in powerbi_data)
+        total_articles = sum(len(user_data.get('Articles', [])) for user_data in powerbi_data)
         
         # Print summary
-        print(f"\n✅ User-centric PowerBI data export complete!")
+        print(f"\n✅ User-centric PowerBI data export with articles complete!")
         print(f"   Data saved to: {filename}")
         print(f"   Total users processed{filter_message}: {len(powerbi_data)}")
         print(f"   Total questions collected: {total_questions}")
+        print(f"   Total articles collected: {total_articles}")
         print(f"   Total time: {duration}")
         print(f"   Total API v3 calls: {API_V3_CALLS}")
         print(f"   Total API v2.3 calls: {API_V2_CALLS}")
@@ -1177,7 +1407,7 @@ def run_cron_job():
     if not RUNNING:
         return
         
-    log("Running scheduled user-centric PowerBI data collection")
+    log("Running scheduled user-centric PowerBI data collection with articles")
     asyncio.run(export_powerbi_data())
 
 def main():
@@ -1185,7 +1415,7 @@ def main():
     
     # Setup argument parser
     parser = argparse.ArgumentParser(
-        description="Universal Async User-Centric PowerBI Data Collector for Stack Overflow Enterprise & Teams with Time Filtering"
+        description="Universal Async User-Centric PowerBI Data Collector for Stack Overflow Enterprise & Teams with Articles and Time Filtering"
     )
     parser.add_argument("--base-url", required=True, 
                        help="Stack Overflow Enterprise or Teams Base URL")
@@ -1268,12 +1498,12 @@ def main():
         else:
             filter_desc = f"users created in the last {filter_type} ({from_date} to {to_date})"
     
-    logger.info(f"Universal Async User-Centric PowerBI Data Collector starting...")
+    logger.info(f"Universal Async User-Centric PowerBI Data Collector with Articles starting...")
     logger.info(f"Instance type: {instance_type.title()}")
     logger.info(f"API v3 Base URL: {CONFIG['api_v3_base']}")
     logger.info(f"API v2.3 Base URL: {CONFIG['api_v2_base']}")
     logger.info(f"Data collection scope: {filter_desc}")
-    logger.info(f"Data structure: User-centric with all questions per user")
+    logger.info(f"Data structure: User-centric with all questions and articles per user")
     if CONFIG.get('output_file'):
         logger.info(f"Output file: {CONFIG['output_file']}")
     else:
@@ -1310,7 +1540,7 @@ def main():
             schedule.run_pending()
             time.sleep(60)  # Check every minute
     
-    logger.info("Universal Async User-Centric PowerBI Data Collector stopped")
+    logger.info("Universal Async User-Centric PowerBI Data Collector with Articles stopped")
 
 if __name__ == "__main__":
     main()
