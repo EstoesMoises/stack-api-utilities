@@ -101,19 +101,24 @@ class ScimClient:
             logging.info(f"Getting 100 users from {self.scim_url} with startIndex of {params['startIndex']}")
             response = self.session.get(self.scim_url, headers=self.headers, params=params, 
                                 proxies=self.proxies, verify=self.ssl_verify)
+            
             if response.status_code != 200:
-                logging.error(f"API call failed with status code: {response.status_code}.")
-                logging.error(response.text)
-                logging.error ("Exiting...")
-                logging.error ("Please try running the script again. "
-                       "If the problem persists, open a GitHub issue.")
-                raise SystemExit
+                logging.warning(f"API call failed with status code: {response.status_code} for startIndex {params['startIndex']}")
+                logging.warning(f"Response: {response.text}")
+                logging.warning("Skipping this page and continuing to next page...")
+                params['startIndex'] += params['count']
+                continue
 
-            items_data = response.json().get('Resources')
+            response_data = response.json()
+            items_data = response_data.get('Resources', [])
             items += items_data
+            
+            total_results = response_data.get('totalResults', 0)
+            logging.info(f"Retrieved {len(items_data)} users from this page. Total collected so far: {len(items)}")
 
             params['startIndex'] += params['count']
-            if params['startIndex'] > response.json().get('totalResults'):
+            if params['startIndex'] > total_results:
+                logging.info(f"Reached end of results. Total users collected: {len(items)}")
                 break
 
         return items
