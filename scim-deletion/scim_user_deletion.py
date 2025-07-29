@@ -11,6 +11,7 @@ import logging
 import json
 import time
 import re
+import random
 from enum import Enum
 from typing import Dict, List, Tuple, Optional
 
@@ -90,6 +91,98 @@ class ErrorHandler:
             logging.error(error_msg)
 
 
+def simulate_user_deletion(user: Dict, index: int) -> Dict:
+    """
+    Simulate a user deletion without making actual API calls.
+    Returns a mock deletion result for dry-run mode.
+    """
+    user_identifier = get_user_identifier(user)
+    
+    # Simulate different outcomes for realistic dry-run results
+    # 90% success rate simulation
+    if random.random() < 0.9:
+        return {
+            'status': 'success',
+            'message': f'[DRY-RUN] Would delete user: {user_identifier}',
+            'user_id': user['id'],
+            'simulated': True
+        }
+    else:
+        # Simulate occasional failures
+        mock_errors = [
+            'User not found',
+            'Permission denied',
+            'User has active content'
+        ]
+        return {
+            'status': 'failed',
+            'message': f'[DRY-RUN] Simulated failure: {random.choice(mock_errors)}',
+            'user_id': user['id'],
+            'simulated': True
+        }
+
+
+def preview_users_to_delete(users_to_delete: List, operation_type: str) -> None:
+    """
+    Show a preview of users that would be deleted in dry-run or before confirmation.
+    """
+    total_users = len(users_to_delete)
+    
+    print(f"\n{'='*60}")
+    print(f"📋 DELETION PREVIEW - {operation_type.upper()}")
+    print(f"{'='*60}")
+    print(f"Total users to be deleted: {total_users}")
+    print(f"{'='*60}")
+    
+    # Show first 10 users as preview
+    preview_count = min(10, total_users)
+    
+    for i, user in enumerate(users_to_delete[:preview_count]):
+        user_identifier = get_user_identifier(user)
+        active_status = "Active" if user.get("active", True) else "Inactive"
+        print(f"{i+1:3d}. {user_identifier} ({active_status})")
+    
+    if total_users > preview_count:
+        print(f"     ... and {total_users - preview_count} more users")
+    
+    print(f"{'='*60}\n")
+
+
+def get_user_confirmation(users_to_delete: List, operation_type: str, dry_run: bool) -> bool:
+    """
+    Get user confirmation before proceeding with deletions.
+    Returns True if user confirms, False otherwise.
+    """
+    if dry_run:
+        return True  # No need for confirmation in dry-run mode
+    
+    preview_users_to_delete(users_to_delete, operation_type)
+    
+    print("⚠️  WARNING: User deletion is IRREVERSIBLE!")
+    print("⚠️  Make sure you have backups and have verified this list!")
+    print()
+    
+    while True:
+        response = input("Are you sure you want to delete these users? (yes/no): ").lower().strip()
+        
+        if response in ['yes', 'y']:
+            # Double confirmation for large operations
+            if len(users_to_delete) > 50:
+                print(f"\n🚨 You are about to delete {len(users_to_delete)} users!")
+                double_confirm = input("Type 'DELETE' to confirm this large operation: ").strip()
+                if double_confirm == 'DELETE':
+                    return True
+                else:
+                    print("❌ Operation cancelled.")
+                    return False
+            return True
+        elif response in ['no', 'n']:
+            print("❌ Operation cancelled.")
+            return False
+        else:
+            print("Please enter 'yes' or 'no'")
+
+
 def main():
     # Configure comprehensive logging
     configure_logging()
@@ -97,6 +190,10 @@ def main():
     args = get_args()
     client = ScimClient(args.token, args.url)
     error_handler = ErrorHandler()
+
+    # Check for dry-run mode
+    if args.dry_run:
+        logging.info("🔍 Running in DRY-RUN mode - no actual deletions will be performed")
 
     # Get all users via SCIM API and write to a JSON file with error handling
     all_users = get_all_users_with_retry(client, error_handler)
@@ -114,14 +211,20 @@ def main():
         logging.info("Please provide only one argument for which users to delete.")
         logging.info("Use --deactivated to delete deactivated users.")
         logging.info("Use --csv to delete users from a CSV file.")
+        logging.info("Use --dry-run to simulate the operation without actual deletions.")
         logging.info("See README for more information.")
         return
 
     elif args.deactivated:
         users_to_delete = [user for user in all_users if not user["active"]]
         logging.info(f"Found {len(users_to_delete)} deactivated users to delete")
+        
+        # Get confirmation unless in dry-run mode
+        if not get_user_confirmation(users_to_delete, "deactivated users", args.dry_run):
+            return
+        
         failed_deletions, skipped_indices, error_summary = delete_users_with_comprehensive_retry(
-            client, users_to_delete, error_handler
+            client, users_to_delete, error_handler, dry_run=args.dry_run
         )
 
     elif args.csv:
@@ -144,8 +247,12 @@ def main():
                 users_to_delete.append(scim_user)
         
         if users_to_delete:
+            # Get confirmation unless in dry-run mode
+            if not get_user_confirmation(users_to_delete, "CSV users", args.dry_run):
+                return
+                
             csv_failed_deletions, csv_skipped_indices, csv_error_summary = delete_users_with_comprehensive_retry(
-                client, users_to_delete, error_handler, include_email=True
+                client, users_to_delete, error_handler, include_email=True, dry_run=args.dry_run
             )
             failed_deletions.extend(csv_failed_deletions)
             skipped_indices.extend(csv_skipped_indices)
@@ -158,11 +265,12 @@ def main():
         logging.info("Please provide an argument for which users to delete.")
         logging.info("Use --deactivated to delete deactivated users.")
         logging.info("Use --csv to delete users from a CSV file.")
+        logging.info("Use --dry-run to simulate the operation without actual deletions.")
         logging.info("See README for more information.")
         return
     
     # Generate comprehensive report
-    generate_final_report(failed_deletions, skipped_indices, error_summary)
+    generate_final_report(failed_deletions, skipped_indices, error_summary, dry_run=args.dry_run)
 
 
 def configure_logging():
@@ -221,7 +329,8 @@ def delete_users_with_comprehensive_retry(
     client, 
     users_to_delete: List, 
     error_handler: ErrorHandler, 
-    include_email: bool = False
+    include_email: bool = False,
+    dry_run: bool = False
 ) -> Tuple[List, List, Dict]:
     """Delete users with comprehensive error handling and retry logic"""
     
@@ -230,7 +339,12 @@ def delete_users_with_comprehensive_retry(
     error_summary = {}
     
     total_users = len(users_to_delete)
-    logging.info(f"Starting deletion process for {total_users} users")
+    
+    if dry_run:
+        logging.info(f"🔍 DRY-RUN MODE: Simulating deletion process for {total_users} users")
+        logging.info("⚠️  No actual deletions will be performed")
+    else:
+        logging.info(f"🗑️  Starting deletion process for {total_users} users")
     
     for index, user in enumerate(users_to_delete):
         user_id = user["id"]
@@ -238,79 +352,97 @@ def delete_users_with_comprehensive_retry(
         
         # Progress logging
         if (index + 1) % 10 == 0 or index == 0:
-            logging.info(f"Processing user {index + 1}/{total_users}: {user_identifier}")
+            status_prefix = "[DRY-RUN] " if dry_run else ""
+            logging.info(f"{status_prefix}Processing user {index + 1}/{total_users}: {user_identifier}")
         
-        deletion_successful = False
-        final_error = None
-        error_history = []
+        if dry_run:
+            # Simulate the deletion process
+            deletion_result = simulate_user_deletion(user, index)
+            
+            if include_email and user.get("emails"):
+                deletion_result['email'] = user["emails"][0]["value"]
+            
+            if deletion_result['status'] != 'success':
+                deletion_result['index'] = index
+                deletion_result['user_identifier'] = user_identifier
+                deletion_result['error_type'] = 'simulated_failure'
+                failed_deletions.append(deletion_result)
+                logging.warning(f"[DRY-RUN] Simulated failure for user {user_identifier}: {deletion_result.get('message', 'No message')}")
+            else:
+                logging.debug(f"[DRY-RUN] Would successfully delete user at index {index}: {user_identifier}")
         
-        attempt = 0
-        while not deletion_successful:
-            try:
-                logging.debug(f"Attempting deletion for user {user_identifier} (attempt {attempt + 1})")
-                deletion_result = client.delete_user(user_id)
-                
-                if include_email and user.get("emails"):
-                    deletion_result['email'] = user["emails"][0]["value"]
-                
-                if deletion_result['status'] != 'success':
-                    # API returned failure status
-                    deletion_result['index'] = index
-                    deletion_result['user_identifier'] = user_identifier
-                    deletion_result['error_type'] = 'api_failure'
-                    failed_deletions.append(deletion_result)
-                    logging.warning(f"API reported failure for user {user_identifier}: {deletion_result.get('message', 'No message')}")
-                else:
-                    logging.debug(f"Successfully deleted user at index {index}: {user_identifier}")
-                
-                deletion_successful = True
-                
-            except Exception as e:
-                error_type = error_handler.classify_error(e)
-                error_history.append({
-                    'attempt': attempt + 1,
-                    'error_type': error_type.value,
-                    'error_message': str(e),
-                    'timestamp': datetime.datetime.now().isoformat()
-                })
-                
-                # Update error summary
-                error_summary[error_type.value] = error_summary.get(error_type.value, 0) + 1
-                
-                error_handler.log_error(e, error_type, f"User {user_identifier} (index {index})", attempt)
-                final_error = e
-                
-                if error_handler.should_retry(error_type, attempt):
-                    delay = error_handler.get_delay(error_type, attempt)
-                    logging.debug(f"Retrying user {user_identifier} in {delay} seconds...")
-                    time.sleep(delay)
-                    attempt += 1
-                else:
-                    # Max retries reached or non-retryable error
-                    skip_info = {
-                        'index': index,
-                        'user_id': user_id,
-                        'user_identifier': user_identifier,
-                        'final_error_type': error_type.value,
-                        'final_error_message': str(e),
-                        'total_attempts': attempt + 1,
-                        'error_history': error_history,
+        else:
+            # Original deletion logic
+            deletion_successful = False
+            final_error = None
+            error_history = []
+            
+            attempt = 0
+            while not deletion_successful:
+                try:
+                    logging.debug(f"Attempting deletion for user {user_identifier} (attempt {attempt + 1})")
+                    deletion_result = client.delete_user(user_id)
+                    
+                    if include_email and user.get("emails"):
+                        deletion_result['email'] = user["emails"][0]["value"]
+                    
+                    if deletion_result['status'] != 'success':
+                        deletion_result['index'] = index
+                        deletion_result['user_identifier'] = user_identifier
+                        deletion_result['error_type'] = 'api_failure'
+                        failed_deletions.append(deletion_result)
+                        logging.warning(f"API reported failure for user {user_identifier}: {deletion_result.get('message', 'No message')}")
+                    else:
+                        logging.debug(f"Successfully deleted user at index {index}: {user_identifier}")
+                    
+                    deletion_successful = True
+                    
+                except Exception as e:
+                    error_type = error_handler.classify_error(e)
+                    error_history.append({
+                        'attempt': attempt + 1,
+                        'error_type': error_type.value,
+                        'error_message': str(e),
                         'timestamp': datetime.datetime.now().isoformat()
-                    }
+                    })
                     
-                    if error_type == ErrorType.AUTHENTICATION_ERROR:
-                        logging.error(f"CRITICAL: Authentication error for user {user_identifier}. This may affect all subsequent deletions.")
+                    error_summary[error_type.value] = error_summary.get(error_type.value, 0) + 1
+                    error_handler.log_error(e, error_type, f"User {user_identifier} (index {index})", attempt)
+                    final_error = e
                     
-                    skipped_indices.append(skip_info)
-                    logging.error(f"Skipping user at index {index} ({user_identifier}) - {error_type.value} after {attempt + 1} attempts")
-                    deletion_successful = True  # Exit retry loop
+                    if error_handler.should_retry(error_type, attempt):
+                        delay = error_handler.get_delay(error_type, attempt)
+                        logging.debug(f"Retrying user {user_identifier} in {delay} seconds...")
+                        time.sleep(delay)
+                        attempt += 1
+                    else:
+                        skip_info = {
+                            'index': index,
+                            'user_id': user_id,
+                            'user_identifier': user_identifier,
+                            'final_error_type': error_type.value,
+                            'final_error_message': str(e),
+                            'total_attempts': attempt + 1,
+                            'error_history': error_history,
+                            'timestamp': datetime.datetime.now().isoformat()
+                        }
+                        
+                        if error_type == ErrorType.AUTHENTICATION_ERROR:
+                            logging.error(f"CRITICAL: Authentication error for user {user_identifier}. This may affect all subsequent deletions.")
+                        
+                        skipped_indices.append(skip_info)
+                        logging.error(f"Skipping user at index {index} ({user_identifier}) - {error_type.value} after {attempt + 1} attempts")
+                        deletion_successful = True
     
     # Log summary
     successful_deletions = total_users - len(failed_deletions) - len(skipped_indices)
-    logging.info(f"Deletion process completed:")
+    mode_prefix = "[DRY-RUN] " if dry_run else ""
+    
+    logging.info(f"{mode_prefix}Deletion process completed:")
     logging.info(f"  Successful: {successful_deletions}")
     logging.info(f"  Failed (API): {len(failed_deletions)}")
-    logging.info(f"  Skipped (Errors): {len(skipped_indices)}")
+    if not dry_run:
+        logging.info(f"  Skipped (Errors): {len(skipped_indices)}")
     
     return failed_deletions, skipped_indices, error_summary
 
@@ -325,14 +457,17 @@ def get_user_identifier(user: Dict) -> str:
         return user["id"]
 
 
-def generate_final_report(failed_deletions: List, skipped_indices: List, error_summary: Dict):
+def generate_final_report(failed_deletions: List, skipped_indices: List, error_summary: Dict, dry_run: bool = False):
     """Generate comprehensive final report with error analysis"""
     
     report_date = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    report_prefix = "dry_run_" if dry_run else ""
     
-    # Log summary of skipped indices by error type
+    # Log summary with dry-run indication
+    mode_text = " (DRY-RUN)" if dry_run else ""
+    
     if skipped_indices:
-        logging.warning(f"Skipped {len(skipped_indices)} user deletions due to errors:")
+        logging.warning(f"Skipped {len(skipped_indices)} user deletions due to errors{mode_text}:")
         
         # Group by error type for summary
         error_type_counts = {}
@@ -351,28 +486,35 @@ def generate_final_report(failed_deletions: List, skipped_indices: List, error_s
     error_analysis = analyze_errors(skipped_indices, error_summary)
     
     if len(failed_deletions) == 0 and len(skipped_indices) == 0:
-        logging.info("All users deleted successfully.")
+        success_msg = f"All users {'would be ' if dry_run else ''}deleted successfully{mode_text}."
+        logging.info(success_msg)
         status_summary = {
             'status': 'complete_success',
-            'message': 'All selected users were deleted successfully.'
+            'message': success_msg,
+            'dry_run': dry_run
         }
     elif len(skipped_indices) == 0:
-        logging.warning("Some users were not deleted successfully (API failures).")
+        partial_msg = f"Some users {'would ' if dry_run else ''}not {'be ' if dry_run else ''}deleted successfully (API failures){mode_text}."
+        logging.warning(partial_msg)
         status_summary = {
             'status': 'partial_success',
-            'message': 'Some deletions failed at the API level.'
+            'message': partial_msg,
+            'dry_run': dry_run
         }
     else:
-        logging.warning("Some users were not deleted due to errors.")
+        failure_msg = f"Some users {'would ' if dry_run else ''}not {'be ' if dry_run else ''}deleted due to errors{mode_text}."
+        logging.warning(failure_msg)
         status_summary = {
             'status': 'partial_failure',
-            'message': 'Some deletions failed due to errors or API issues.'
+            'message': failure_msg,
+            'dry_run': dry_run
         }
 
     # Create comprehensive report
     deletion_report = {
         'summary': {
             'timestamp': report_date,
+            'dry_run_mode': dry_run,
             'total_processed': len(failed_deletions) + len(skipped_indices),
             'api_failures': len(failed_deletions),
             'error_skipped': len(skipped_indices),
@@ -385,8 +527,21 @@ def generate_final_report(failed_deletions: List, skipped_indices: List, error_s
         'recommendations': generate_recommendations(error_analysis)
     }
 
-    write_json(deletion_report, f"deletion_report_{report_date}")
-    logging.info(f"Comprehensive report written to deletion_report_{report_date}.json")
+    report_filename = f"{report_prefix}deletion_report_{report_date}"
+    write_json(deletion_report, report_filename)
+    
+    report_type = "DRY-RUN report" if dry_run else "Comprehensive report"
+    logging.info(f"{report_type} written to {report_filename}.json")
+
+    # Dry-run specific messaging
+    if dry_run:
+        print(f"\n{'='*60}")
+        print("🔍 DRY-RUN COMPLETED")
+        print(f"{'='*60}")
+        print("✅ No actual deletions were performed")
+        print(f"📊 Report saved to: {report_filename}.json")
+        print("💡 Review the results and run without --dry-run to execute")
+        print(f"{'='*60}\n")
 
 
 def analyze_errors(skipped_indices: List, error_summary: Dict) -> Dict:
@@ -503,6 +658,12 @@ def get_args():
         "--deactivated",
         action="store_true",
         help="Delete deactivated users."
+    )
+
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Simulate the deletion process without actually deleting users. Shows what would be deleted."
     )
 
     return parser.parse_args()
