@@ -9,117 +9,26 @@ import csv
 import datetime
 import logging
 import json
-import time
-import re
-import random
-from enum import Enum
 from typing import Dict, List, Tuple, Optional
 
 # Local libraries
-from so4t_scim import ScimClient
-
-
-class ErrorType(Enum):
-    """Enumeration of different error types for classification"""
-    SERVER_ERROR = "server_error"  # 5xx errors
-    CLIENT_ERROR = "client_error"  # 4xx errors
-    NETWORK_ERROR = "network_error"  # Connection/timeout issues
-    AUTHENTICATION_ERROR = "auth_error"  # 401/403 errors
-    RATE_LIMIT_ERROR = "rate_limit_error"  # 429 errors
-    UNKNOWN_ERROR = "unknown_error"  # Any other errors
-
-
-class ErrorHandler:
-    """Centralized error handling and classification"""
-    
-    def __init__(self):
-        self.error_patterns = {
-            ErrorType.SERVER_ERROR: [r'50[0-9]', r'server error', r'internal error'],
-            ErrorType.CLIENT_ERROR: [r'40[0-9]', r'client error', r'bad request'],
-            ErrorType.AUTHENTICATION_ERROR: [r'401', r'403', r'unauthorized', r'forbidden', r'authentication'],
-            ErrorType.RATE_LIMIT_ERROR: [r'429', r'rate limit', r'too many requests'],
-            ErrorType.NETWORK_ERROR: [r'connection', r'timeout', r'network', r'dns', r'unreachable']
-        }
-        
-        self.retry_config = {
-            ErrorType.SERVER_ERROR: {'max_retries': 3, 'base_delay': 2, 'exponential': True},
-            ErrorType.RATE_LIMIT_ERROR: {'max_retries': 5, 'base_delay': 5, 'exponential': True},
-            ErrorType.NETWORK_ERROR: {'max_retries': 3, 'base_delay': 1, 'exponential': True},
-            ErrorType.CLIENT_ERROR: {'max_retries': 1, 'base_delay': 0, 'exponential': False},
-            ErrorType.AUTHENTICATION_ERROR: {'max_retries': 0, 'base_delay': 0, 'exponential': False},
-            ErrorType.UNKNOWN_ERROR: {'max_retries': 2, 'base_delay': 1, 'exponential': True}
-        }
-    
-    def classify_error(self, error: Exception) -> ErrorType:
-        """Classify an error based on its message and type"""
-        error_str = str(error).lower()
-        error_type_name = type(error).__name__.lower()
-        
-        for error_type, patterns in self.error_patterns.items():
-            for pattern in patterns:
-                if re.search(pattern, error_str) or re.search(pattern, error_type_name):
-                    return error_type
-        
-        return ErrorType.UNKNOWN_ERROR
-    
-    def should_retry(self, error_type: ErrorType, attempt: int) -> bool:
-        """Determine if an error should be retried based on type and attempt number"""
-        config = self.retry_config.get(error_type, self.retry_config[ErrorType.UNKNOWN_ERROR])
-        return attempt < config['max_retries']
-    
-    def get_delay(self, error_type: ErrorType, attempt: int) -> float:
-        """Calculate delay before retry based on error type and attempt number"""
-        config = self.retry_config.get(error_type, self.retry_config[ErrorType.UNKNOWN_ERROR])
-        base_delay = config['base_delay']
-        
-        if config['exponential']:
-            return base_delay * (2 ** attempt)
-        else:
-            return base_delay
-    
-    def log_error(self, error: Exception, error_type: ErrorType, context: str, attempt: int = 0):
-        """Log error with appropriate level and context"""
-        error_msg = f"{context} - {error_type.value}: {str(error)}"
-        
-        if error_type in [ErrorType.SERVER_ERROR, ErrorType.NETWORK_ERROR] and attempt > 0:
-            logging.warning(f"Attempt {attempt + 1} - {error_msg}")
-        elif error_type == ErrorType.AUTHENTICATION_ERROR:
-            logging.error(f"CRITICAL - {error_msg}")
-        elif error_type == ErrorType.RATE_LIMIT_ERROR:
-            logging.warning(f"RATE LIMITED - {error_msg}")
-        else:
-            logging.error(error_msg)
+from so4t_scim import ScimClient, ErrorHandler
 
 
 def simulate_user_deletion(user: Dict, index: int) -> Dict:
     """
     Simulate a user deletion without making actual API calls.
-    Returns a mock deletion result for dry-run mode.
+    Shows what would happen without executing the deletion.
     """
     user_identifier = get_user_identifier(user)
     
-    # Simulate different outcomes for realistic dry-run results
-    # 90% success rate simulation
-    if random.random() < 0.9:
-        return {
-            'status': 'success',
-            'message': f'[DRY-RUN] Would delete user: {user_identifier}',
-            'user_id': user['id'],
-            'simulated': True
-        }
-    else:
-        # Simulate occasional failures
-        mock_errors = [
-            'User not found',
-            'Permission denied',
-            'User has active content'
-        ]
-        return {
-            'status': 'failed',
-            'message': f'[DRY-RUN] Simulated failure: {random.choice(mock_errors)}',
-            'user_id': user['id'],
-            'simulated': True
-        }
+    # True dry-run: show what would be attempted
+    return {
+        'status': 'success',
+        'message': f'[DRY-RUN] Would delete user: {user_identifier}',
+        'account_id': user['id'],
+        'dry_run': True
+    }
 
 
 def preview_users_to_delete(users_to_delete: List, operation_type: str) -> None:
@@ -188,24 +97,27 @@ def main():
     configure_logging()
     
     args = get_args()
-    client = ScimClient(args.token, args.url)
+    
+    # Create error handler for customization if needed
     error_handler = ErrorHandler()
+    
+    # Client now handles all retry logic internally
+    client = ScimClient(args.token, args.url, error_handler=error_handler)
 
     # Check for dry-run mode
     if args.dry_run:
         logging.info("🔍 Running in DRY-RUN mode - no actual deletions will be performed")
 
-    # Get all users via SCIM API and write to a JSON file with error handling
-    all_users = get_all_users_with_retry(client, error_handler)
-    if not all_users:
-        logging.error("Failed to retrieve users. Exiting.")
+    # Get all users via SCIM API - retry logic now built into client
+    try:
+        all_users = client.get_all_users()
+        logging.info(f"Successfully retrieved {len(all_users)} users")
+        write_json(all_users, 'all_users')
+    except Exception as e:
+        logging.error(f"Failed to retrieve users after retries: {e}")
         return
-    
-    write_json(all_users, 'all_users')
 
     failed_deletions = []
-    skipped_indices = []
-    error_summary = {}
     
     if args.deactivated and args.csv:
         logging.info("Please provide only one argument for which users to delete.")
@@ -223,9 +135,10 @@ def main():
         if not get_user_confirmation(users_to_delete, "deactivated users", args.dry_run):
             return
         
-        failed_deletions, skipped_indices, error_summary = delete_users_with_comprehensive_retry(
-            client, users_to_delete, error_handler, dry_run=args.dry_run
+        failed_deletions = delete_users_simplified(
+            client, users_to_delete, dry_run=args.dry_run
         )
+        generate_final_report(failed_deletions, len(users_to_delete), dry_run=args.dry_run)
 
     elif args.csv:
         csv_users_to_delete = get_users_from_csv(args.csv)
@@ -237,7 +150,7 @@ def main():
             if scim_user is None:
                 deletion_result = {
                     'email': user_email,
-                    'status': 'failed',
+                    'status': 'error',
                     'message': 'User email address not found via SCIM API',
                     'error_type': 'lookup_failed'
                 }
@@ -251,15 +164,14 @@ def main():
             if not get_user_confirmation(users_to_delete, "CSV users", args.dry_run):
                 return
                 
-            csv_failed_deletions, csv_skipped_indices, csv_error_summary = delete_users_with_comprehensive_retry(
-                client, users_to_delete, error_handler, include_email=True, dry_run=args.dry_run
+            csv_failed_deletions = delete_users_simplified(
+                client, users_to_delete, include_email=True, dry_run=args.dry_run
             )
             failed_deletions.extend(csv_failed_deletions)
-            skipped_indices.extend(csv_skipped_indices)
             
-            # Merge error summaries
-            for error_type, count in csv_error_summary.items():
-                error_summary[error_type] = error_summary.get(error_type, 0) + count
+        # Generate report with total count including CSV lookup failures
+        total_attempted = len(csv_users_to_delete)  # Total from CSV file
+        generate_final_report(failed_deletions, total_attempted, dry_run=args.dry_run)
 
     else:
         logging.info("Please provide an argument for which users to delete.")
@@ -268,9 +180,6 @@ def main():
         logging.info("Use --dry-run to simulate the operation without actual deletions.")
         logging.info("See README for more information.")
         return
-    
-    # Generate comprehensive report
-    generate_final_report(failed_deletions, skipped_indices, error_summary, dry_run=args.dry_run)
 
 
 def configure_logging():
@@ -300,44 +209,15 @@ def configure_logging():
     logging.info("Logging configured - detailed logs written to file")
 
 
-def get_all_users_with_retry(client, error_handler: ErrorHandler, max_attempts: int = 3) -> Optional[List]:
-    """Get all users with comprehensive retry logic"""
-    
-    for attempt in range(max_attempts):
-        try:
-            logging.info(f"Attempting to fetch all users (attempt {attempt + 1}/{max_attempts})")
-            users = client.get_all_users()
-            logging.info(f"Successfully retrieved {len(users)} users")
-            return users
-            
-        except Exception as e:
-            error_type = error_handler.classify_error(e)
-            error_handler.log_error(e, error_type, "Fetching all users", attempt)
-            
-            if error_handler.should_retry(error_type, attempt) and attempt < max_attempts - 1:
-                delay = error_handler.get_delay(error_type, attempt)
-                logging.info(f"Retrying in {delay} seconds...")
-                time.sleep(delay)
-            else:
-                logging.error(f"Failed to fetch users after {max_attempts} attempts")
-                return None
-    
-    return None
-
-
-def delete_users_with_comprehensive_retry(
-    client, 
+def delete_users_simplified(
+    client: ScimClient, 
     users_to_delete: List, 
-    error_handler: ErrorHandler, 
     include_email: bool = False,
     dry_run: bool = False
-) -> Tuple[List, List, Dict]:
-    """Delete users with comprehensive error handling and retry logic"""
+) -> List:
+    """Simplified user deletion - retry logic now handled by client"""
     
     failed_deletions = []
-    skipped_indices = []
-    error_summary = {}
-    
     total_users = len(users_to_delete)
     
     if dry_run:
@@ -345,6 +225,8 @@ def delete_users_with_comprehensive_retry(
         logging.info("⚠️  No actual deletions will be performed")
     else:
         logging.info(f"🗑️  Starting deletion process for {total_users} users")
+    
+    successful_deletions = 0
     
     for index, user in enumerate(users_to_delete):
         user_id = user["id"]
@@ -365,86 +247,55 @@ def delete_users_with_comprehensive_retry(
             if deletion_result['status'] != 'success':
                 deletion_result['index'] = index
                 deletion_result['user_identifier'] = user_identifier
-                deletion_result['error_type'] = 'simulated_failure'
                 failed_deletions.append(deletion_result)
-                logging.warning(f"[DRY-RUN] Simulated failure for user {user_identifier}: {deletion_result.get('message', 'No message')}")
+                logging.warning(f"[DRY-RUN] Would attempt to delete user {user_identifier}")
             else:
+                successful_deletions += 1
                 logging.debug(f"[DRY-RUN] Would successfully delete user at index {index}: {user_identifier}")
         
         else:
-            # Original deletion logic
-            deletion_successful = False
-            final_error = None
-            error_history = []
-            
-            attempt = 0
-            while not deletion_successful:
-                try:
-                    logging.debug(f"Attempting deletion for user {user_identifier} (attempt {attempt + 1})")
-                    deletion_result = client.delete_user(user_id)
+            # Real deletion using client with built-in retry
+            try:
+                deletion_result = client.delete_user(user_id)
+                
+                if include_email and user.get("emails"):
+                    deletion_result['email'] = user["emails"][0]["value"]
+                
+                if deletion_result['status'] != 'success':
+                    deletion_result['index'] = index
+                    deletion_result['user_identifier'] = user_identifier
+                    failed_deletions.append(deletion_result)
+                    logging.warning(f"API reported failure for user {user_identifier}: {deletion_result.get('message', 'No message')}")
+                else:
+                    successful_deletions += 1
+                    logging.debug(f"Successfully deleted user at index {index}: {user_identifier}")
                     
-                    if include_email and user.get("emails"):
-                        deletion_result['email'] = user["emails"][0]["value"]
-                    
-                    if deletion_result['status'] != 'success':
-                        deletion_result['index'] = index
-                        deletion_result['user_identifier'] = user_identifier
-                        deletion_result['error_type'] = 'api_failure'
-                        failed_deletions.append(deletion_result)
-                        logging.warning(f"API reported failure for user {user_identifier}: {deletion_result.get('message', 'No message')}")
-                    else:
-                        logging.debug(f"Successfully deleted user at index {index}: {user_identifier}")
-                    
-                    deletion_successful = True
-                    
-                except Exception as e:
-                    error_type = error_handler.classify_error(e)
-                    error_history.append({
-                        'attempt': attempt + 1,
-                        'error_type': error_type.value,
-                        'error_message': str(e),
-                        'timestamp': datetime.datetime.now().isoformat()
-                    })
-                    
-                    error_summary[error_type.value] = error_summary.get(error_type.value, 0) + 1
-                    error_handler.log_error(e, error_type, f"User {user_identifier} (index {index})", attempt)
-                    final_error = e
-                    
-                    if error_handler.should_retry(error_type, attempt):
-                        delay = error_handler.get_delay(error_type, attempt)
-                        logging.debug(f"Retrying user {user_identifier} in {delay} seconds...")
-                        time.sleep(delay)
-                        attempt += 1
-                    else:
-                        skip_info = {
-                            'index': index,
-                            'user_id': user_id,
-                            'user_identifier': user_identifier,
-                            'final_error_type': error_type.value,
-                            'final_error_message': str(e),
-                            'total_attempts': attempt + 1,
-                            'error_history': error_history,
-                            'timestamp': datetime.datetime.now().isoformat()
-                        }
-                        
-                        if error_type == ErrorType.AUTHENTICATION_ERROR:
-                            logging.error(f"CRITICAL: Authentication error for user {user_identifier}. This may affect all subsequent deletions.")
-                        
-                        skipped_indices.append(skip_info)
-                        logging.error(f"Skipping user at index {index} ({user_identifier}) - {error_type.value} after {attempt + 1} attempts")
-                        deletion_successful = True
+            except Exception as e:
+                # This should rarely happen now since client handles retries
+                # Only unrecoverable errors should reach here
+                deletion_result = {
+                    'index': index,
+                    'account_id': user_id,
+                    'user_identifier': user_identifier,
+                    'status': 'error',
+                    'message': f'Unrecoverable error after retries: {str(e)}',
+                    'error_type': 'unrecoverable_error'
+                }
+                
+                if include_email and user.get("emails"):
+                    deletion_result['email'] = user["emails"][0]["value"]
+                
+                failed_deletions.append(deletion_result)
+                logging.error(f"Unrecoverable error for user {user_identifier}: {e}")
     
     # Log summary
-    successful_deletions = total_users - len(failed_deletions) - len(skipped_indices)
     mode_prefix = "[DRY-RUN] " if dry_run else ""
     
     logging.info(f"{mode_prefix}Deletion process completed:")
     logging.info(f"  Successful: {successful_deletions}")
-    logging.info(f"  Failed (API): {len(failed_deletions)}")
-    if not dry_run:
-        logging.info(f"  Skipped (Errors): {len(skipped_indices)}")
+    logging.info(f"  Failed: {len(failed_deletions)}")
     
-    return failed_deletions, skipped_indices, error_summary
+    return failed_deletions
 
 
 def get_user_identifier(user: Dict) -> str:
@@ -457,8 +308,8 @@ def get_user_identifier(user: Dict) -> str:
         return user["id"]
 
 
-def generate_final_report(failed_deletions: List, skipped_indices: List, error_summary: Dict, dry_run: bool = False):
-    """Generate comprehensive final report with error analysis"""
+def generate_final_report(failed_deletions: List, total_processed: int = 0, dry_run: bool = False):
+    """Generate simplified final report"""
     
     report_date = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     report_prefix = "dry_run_" if dry_run else ""
@@ -466,43 +317,25 @@ def generate_final_report(failed_deletions: List, skipped_indices: List, error_s
     # Log summary with dry-run indication
     mode_text = " (DRY-RUN)" if dry_run else ""
     
-    if skipped_indices:
-        logging.warning(f"Skipped {len(skipped_indices)} user deletions due to errors{mode_text}:")
-        
-        # Group by error type for summary
-        error_type_counts = {}
-        for skip_info in skipped_indices:
-            error_type = skip_info['final_error_type']
-            error_type_counts[error_type] = error_type_counts.get(error_type, 0) + 1
-        
-        for error_type, count in error_type_counts.items():
-            logging.warning(f"  {error_type}: {count} users")
-            
-        # Log individual skipped users at debug level
-        for skip_info in skipped_indices:
-            logging.debug(f"  Index {skip_info['index']}: {skip_info['final_error_type']} - {skip_info['user_identifier']}")
-
-    # Generate error analysis
-    error_analysis = analyze_errors(skipped_indices, error_summary)
-    
-    if len(failed_deletions) == 0 and len(skipped_indices) == 0:
-        success_msg = f"All users {'would be ' if dry_run else ''}deleted successfully{mode_text}."
+    if total_processed == 0:
+        no_users_msg = f"No users {'would be ' if dry_run else 'were '}processed - no users found matching criteria{mode_text}."
+        logging.info(no_users_msg)
+        status_summary = {
+            'status': 'no_users_found',
+            'message': no_users_msg,
+            'dry_run': dry_run
+        }
+    elif len(failed_deletions) == 0:
+        success_msg = f"All {total_processed} users {'would be ' if dry_run else 'were '}deleted successfully{mode_text}."
         logging.info(success_msg)
         status_summary = {
-            'status': 'complete_success',
+            'status': 'complete_success', 
             'message': success_msg,
             'dry_run': dry_run
         }
-    elif len(skipped_indices) == 0:
-        partial_msg = f"Some users {'would ' if dry_run else ''}not {'be ' if dry_run else ''}deleted successfully (API failures){mode_text}."
-        logging.warning(partial_msg)
-        status_summary = {
-            'status': 'partial_success',
-            'message': partial_msg,
-            'dry_run': dry_run
-        }
     else:
-        failure_msg = f"Some users {'would ' if dry_run else ''}not {'be ' if dry_run else ''}deleted due to errors{mode_text}."
+        successful_count = total_processed - len(failed_deletions)
+        failure_msg = f"{successful_count}/{total_processed} users {'would be ' if dry_run else 'were '}deleted successfully. {len(failed_deletions)} failed{mode_text}."
         logging.warning(failure_msg)
         status_summary = {
             'status': 'partial_failure',
@@ -510,20 +343,20 @@ def generate_final_report(failed_deletions: List, skipped_indices: List, error_s
             'dry_run': dry_run
         }
 
+    # Analyze failed deletions
+    error_analysis = analyze_failed_deletions(failed_deletions)
+
     # Create comprehensive report
     deletion_report = {
         'summary': {
             'timestamp': report_date,
             'dry_run_mode': dry_run,
-            'total_processed': len(failed_deletions) + len(skipped_indices),
-            'api_failures': len(failed_deletions),
-            'error_skipped': len(skipped_indices),
+            'total_processed': total_processed,
+            'total_failures': len(failed_deletions),
             'status': status_summary
         },
         'error_analysis': error_analysis,
         'failed_deletions': failed_deletions,
-        'skipped_indices': skipped_indices,
-        'raw_error_summary': error_summary,
         'recommendations': generate_recommendations(error_analysis)
     }
 
@@ -544,46 +377,32 @@ def generate_final_report(failed_deletions: List, skipped_indices: List, error_s
         print(f"{'='*60}\n")
 
 
-def analyze_errors(skipped_indices: List, error_summary: Dict) -> Dict:
-    """Analyze error patterns and provide insights"""
+def analyze_failed_deletions(failed_deletions: List) -> Dict:
+    """Analyze failure patterns and provide insights"""
     
-    if not skipped_indices:
-        return {'message': 'No errors to analyze'}
+    if not failed_deletions:
+        return {'message': 'No failures to analyze'}
     
     analysis = {
-        'most_common_errors': {},
-        'error_patterns': {},
-        'critical_issues': [],
-        'retry_effectiveness': {}
+        'total_failures': len(failed_deletions),
+        'failure_types': {},
+        'common_issues': []
     }
     
-    # Analyze most common errors
-    for error_type, count in error_summary.items():
-        analysis['most_common_errors'][error_type] = count
+    # Count failure types
+    for failure in failed_deletions:
+        error_type = failure.get('error_type', 'unknown')
+        analysis['failure_types'][error_type] = analysis['failure_types'].get(error_type, 0) + 1
     
-    # Analyze retry patterns
-    total_attempts = 0
-    successful_retries = 0
+    # Identify common issues
+    if 'lookup_failed' in analysis['failure_types']:
+        analysis['common_issues'].append(f"User lookup failures: {analysis['failure_types']['lookup_failed']} users not found in SCIM")
     
-    for skip_info in skipped_indices:
-        attempts = skip_info.get('total_attempts', 1)
-        total_attempts += attempts
-        
-        if attempts > 1:
-            successful_retries += (attempts - 1)  # All attempts except the last were "successful" retries
+    if 'simulated_failure' in analysis['failure_types']:
+        analysis['common_issues'].append(f"Simulated failures (dry-run): {analysis['failure_types']['simulated_failure']} users")
     
-    if total_attempts > len(skipped_indices):
-        analysis['retry_effectiveness']['average_attempts_per_failure'] = total_attempts / len(skipped_indices)
-        analysis['retry_effectiveness']['total_retry_attempts'] = successful_retries
-    
-    # Identify critical issues
-    auth_errors = sum(1 for skip in skipped_indices if skip['final_error_type'] == 'auth_error')
-    if auth_errors > 0:
-        analysis['critical_issues'].append(f"Authentication errors detected ({auth_errors} users) - check credentials")
-    
-    rate_limit_errors = sum(1 for skip in skipped_indices if skip['final_error_type'] == 'rate_limit_error')
-    if rate_limit_errors > len(skipped_indices) * 0.3:  # More than 30% rate limited
-        analysis['critical_issues'].append("High rate limiting detected - consider slower processing")
+    if 'api_failure' in analysis['failure_types']:
+        analysis['common_issues'].append(f"API failures: {analysis['failure_types']['api_failure']} users could not be deleted")
     
     return analysis
 
@@ -593,38 +412,28 @@ def generate_recommendations(error_analysis: Dict) -> List[str]:
     
     recommendations = []
     
-    if not error_analysis or error_analysis.get('message') == 'No errors to analyze':
+    if not error_analysis or error_analysis.get('message') == 'No failures to analyze':
         return ["No specific recommendations - all deletions completed successfully"]
     
-    most_common = error_analysis.get('most_common_errors', {})
-    critical_issues = error_analysis.get('critical_issues', [])
+    failure_types = error_analysis.get('failure_types', {})
     
-    # Authentication recommendations
-    if 'auth_error' in most_common:
-        recommendations.append("Verify SCIM token validity and permissions")
-        recommendations.append("Check if token has expired or been revoked")
+    # Lookup failure recommendations
+    if 'lookup_failed' in failure_types:
+        recommendations.append("Some users were not found in SCIM - verify email addresses in CSV")
+        recommendations.append("Check if users have been already deleted or never existed")
     
-    # Rate limiting recommendations
-    if 'rate_limit_error' in most_common:
-        recommendations.append("Implement longer delays between requests")
-        recommendations.append("Consider processing users in smaller batches")
+    # API failure recommendations
+    if 'api_failure' in failure_types:
+        recommendations.append("API failures detected - check user permissions and SCIM settings")
+        recommendations.append("Review deletion_report.json for specific error messages")
     
-    # Server error recommendations
-    if 'server_error' in most_common:
-        recommendations.append("Server errors detected - consider running during off-peak hours")
-        recommendations.append("Monitor Stack Overflow status page for ongoing issues")
-    
-    # Network recommendations
-    if 'network_error' in most_common:
-        recommendations.append("Check network connectivity and DNS resolution")
-        recommendations.append("Consider running from a more stable network connection")
-    
-    # Add critical issue recommendations
-    recommendations.extend(critical_issues)
+    # Unrecoverable error recommendations
+    if 'unrecoverable_error' in failure_types:
+        recommendations.append("Unrecoverable errors occurred - check network connectivity and API status")
+        recommendations.append("Consider contacting Stack Overflow support if errors persist")
     
     if not recommendations:
         recommendations.append("Review detailed error logs for specific issues")
-        recommendations.append("Consider contacting Stack Overflow support if errors persist")
     
     return recommendations
 

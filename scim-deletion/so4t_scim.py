@@ -6,29 +6,114 @@ https://github.com/jklick-so/so4t_scim_user_deletion/issues
 
 # Standard Python libraries
 import logging
+import time
+import re
+from enum import Enum
+from typing import Optional, Callable, Any
 
 # Open source libraries
 import requests
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential, RetryError
 
-# Set up logging
-logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
+
+class ErrorType(Enum):
+    """Enumeration of different error types for classification"""
+    SERVER_ERROR = "server_error"  # 5xx errors
+    CLIENT_ERROR = "client_error"  # 4xx errors
+    NETWORK_ERROR = "network_error"  # Connection/timeout issues
+    AUTHENTICATION_ERROR = "auth_error"  # 401/403 errors
+    RATE_LIMIT_ERROR = "rate_limit_error"  # 429 errors
+    UNKNOWN_ERROR = "unknown_error"  # Any other errors
+
+
+class ErrorHandler:
+    """Centralized error handling and classification"""
+    
+    def __init__(self):
+        self.error_patterns = {
+            ErrorType.SERVER_ERROR: [r'50[0-9]', r'server error', r'internal error'],
+            ErrorType.CLIENT_ERROR: [r'40[0-9]', r'client error', r'bad request'],
+            ErrorType.AUTHENTICATION_ERROR: [r'401', r'403', r'unauthorized', r'forbidden', r'authentication'],
+            ErrorType.RATE_LIMIT_ERROR: [r'429', r'rate limit', r'too many requests'],
+            ErrorType.NETWORK_ERROR: [r'connection', r'timeout', r'network', r'dns', r'unreachable']
+        }
+        
+        self.retry_config = {
+            ErrorType.SERVER_ERROR: {'max_retries': 3, 'base_delay': 2, 'exponential': True},
+            ErrorType.RATE_LIMIT_ERROR: {'max_retries': 5, 'base_delay': 5, 'exponential': True},
+            ErrorType.NETWORK_ERROR: {'max_retries': 3, 'base_delay': 1, 'exponential': True},
+            ErrorType.CLIENT_ERROR: {'max_retries': 1, 'base_delay': 0, 'exponential': False},
+            ErrorType.AUTHENTICATION_ERROR: {'max_retries': 0, 'base_delay': 0, 'exponential': False},
+            ErrorType.UNKNOWN_ERROR: {'max_retries': 2, 'base_delay': 1, 'exponential': True}
+        }
+    
+    def classify_error(self, error: Exception, status_code: Optional[int] = None) -> ErrorType:
+        """Classify an error based on its message, type, and HTTP status code"""
+        error_str = str(error).lower()
+        error_type_name = type(error).__name__.lower()
+        
+        # Check HTTP status code first if available
+        if status_code:
+            if status_code == 429:
+                return ErrorType.RATE_LIMIT_ERROR
+            elif status_code in [401, 403]:
+                return ErrorType.AUTHENTICATION_ERROR
+            elif 400 <= status_code < 500:
+                return ErrorType.CLIENT_ERROR
+            elif 500 <= status_code < 600:
+                return ErrorType.SERVER_ERROR
+        
+        # Check error patterns
+        for error_type, patterns in self.error_patterns.items():
+            for pattern in patterns:
+                if re.search(pattern, error_str) or re.search(pattern, error_type_name):
+                    return error_type
+        
+        return ErrorType.UNKNOWN_ERROR
+    
+    def should_retry(self, error_type: ErrorType, attempt: int) -> bool:
+        """Determine if an error should be retried based on type and attempt number"""
+        config = self.retry_config.get(error_type, self.retry_config[ErrorType.UNKNOWN_ERROR])
+        return attempt < config['max_retries']
+    
+    def get_delay(self, error_type: ErrorType, attempt: int) -> float:
+        """Calculate delay before retry based on error type and attempt number"""
+        config = self.retry_config.get(error_type, self.retry_config[ErrorType.UNKNOWN_ERROR])
+        base_delay = config['base_delay']
+        
+        if config['exponential']:
+            return base_delay * (2 ** attempt)
+        else:
+            return base_delay
+    
+    def log_error(self, error: Exception, error_type: ErrorType, context: str, attempt: int = 0):
+        """Log error with appropriate level and context"""
+        error_msg = f"{context} - {error_type.value}: {str(error)}"
+        
+        if error_type in [ErrorType.SERVER_ERROR, ErrorType.NETWORK_ERROR] and attempt > 0:
+            logging.warning(f"Attempt {attempt + 1} - {error_msg}")
+        elif error_type == ErrorType.AUTHENTICATION_ERROR:
+            logging.error(f"CRITICAL - {error_msg}")
+        elif error_type == ErrorType.RATE_LIMIT_ERROR:
+            logging.warning(f"RATE LIMITED - {error_msg}")
+        else:
+            logging.error(error_msg)
 
 
 class ScimClient:
     VALID_ROLES = ["Registered", "Moderator", "Admin"]
-    MAX_RETRIES = 3
 
-    def __init__(self, token, url, proxy=None):
+    def __init__(self, token, url, proxy=None, error_handler=None):
         self.session = requests.Session()
         self.base_url = url
         self.token = token
-        # Add User-Agent to headers 
+        self.error_handler = error_handler or ErrorHandler()
+        
         self.headers = {
             'Authorization': f"Bearer {self.token}",
             'User-Agent': 'so4t_scim_user_deletion/1.0 (http://your-app-url.com; your-contact@email.com)'
         }
         self.proxies = {'https': proxy} if proxy else {'https': None}
+        
         if "stackoverflowteams.com" in self.base_url: # For Basic and Business tiers
             self.soe = False
             self.scim_url = f"{self.base_url}/auth/scim/v2/users"
@@ -38,14 +123,55 @@ class ScimClient:
 
         self.ssl_verify = self.test_connection()
 
-    
+    def _retry_request(self, request_func: Callable, context: str) -> Any:
+        """Generic retry wrapper for all SCIM operations"""
+        attempt = 0
+        
+        while True:
+            try:
+                return request_func()
+            except requests.exceptions.RequestException as e:
+                # Get status code if available
+                status_code = getattr(e.response, 'status_code', None) if hasattr(e, 'response') and e.response else None
+                
+                error_type = self.error_handler.classify_error(e, status_code)
+                self.error_handler.log_error(e, error_type, context, attempt)
+                
+                if self.error_handler.should_retry(error_type, attempt):
+                    delay = self.error_handler.get_delay(error_type, attempt)
+                    logging.info(f"Retrying {context} in {delay} seconds...")
+                    time.sleep(delay)
+                    attempt += 1
+                else:
+                    raise  # Re-raise the exception after exhausting retries
+            except Exception as e:
+                # Handle non-request exceptions
+                error_type = self.error_handler.classify_error(e)
+                self.error_handler.log_error(e, error_type, context, attempt)
+                
+                if self.error_handler.should_retry(error_type, attempt):
+                    delay = self.error_handler.get_delay(error_type, attempt)
+                    logging.info(f"Retrying {context} in {delay} seconds...")
+                    time.sleep(delay)
+                    attempt += 1
+                else:
+                    raise
+
     def test_connection(self):
         ssl_verify = True
 
         logging.info("Testing SCIM connection...")
+        
+        def _test_connection_request():
+            return self.session.get(
+                self.scim_url, 
+                headers=self.headers, 
+                proxies=self.proxies,
+                verify=ssl_verify
+            )
+        
         try:
-            response = self.session.get(self.scim_url, headers=self.headers, proxies=self.proxies,
-                                    verify=ssl_verify)
+            response = _test_connection_request()
         except requests.exceptions.SSLError:
             logging.warning(f"Received SSL error when connecting to {self.base_url}.")
             logging.warning("If you're sure the URL is correct (and trusted), you can proceed without SSL "
@@ -71,147 +197,163 @@ class ScimClient:
             logging.error("Exiting...")
             raise SystemExit
 
-
     def get_user(self, account_id):
-        scim_user_url = f"{self.scim_url}/{account_id}"
-        response = self.session.get(scim_user_url, headers=self.headers)
+        """Get a single user with retry logic"""
+        def _get_user_request():
+            scim_user_url = f"{self.scim_url}/{account_id}"
+            response = self.session.get(scim_user_url, headers=self.headers)
 
-        if response.status_code == 404:
-            logging.info(f"User with account ID {account_id} not found.")
+            if response.status_code == 404:
+                logging.info(f"User with account ID {account_id} not found.")
+                return None
+            elif response.status_code != 200:
+                # Raise an exception to trigger retry logic
+                response.raise_for_status()
+            else:
+                logging.info(f"Retrieved user with account ID {account_id}")
+                return response.json()
+        
+        try:
+            return self._retry_request(
+                _get_user_request,
+                context=f"Getting user {account_id}"
+            )
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to get user {account_id} after retries: {e}")
             return None
-
-        elif response.status_code != 200:
-            logging.error(f"API call failed with status code: {response.status_code}.")
-            logging.error(response.text)
-            return None
-
-        else:
-            logging.info(f"Retrieved user with account ID {account_id}")
-            return response.json()
-    
 
     def get_all_users(self):
-        params = {
-            "count": 100,
-            "startIndex": 1,
-        }
-
+        """Fetch all users with page-level retry"""
         items = []
+        start_index = 1
+        count = 100
+        
         while True:
-            logging.info(f"Getting 100 users from {self.scim_url} with startIndex of {params['startIndex']}")
-            response = self.session.get(self.scim_url, headers=self.headers, params=params, 
-                                proxies=self.proxies, verify=self.ssl_verify)
+            def _get_users_page():
+                params = {
+                    "count": count,
+                    "startIndex": start_index,
+                }
+                
+                logging.info(f"Getting {count} users from {self.scim_url} with startIndex of {start_index}")
+                response = self.session.get(
+                    self.scim_url, 
+                    headers=self.headers, 
+                    params=params,
+                    proxies=self.proxies, 
+                    verify=self.ssl_verify
+                )
+                
+                if response.status_code != 200:
+                    response.raise_for_status()
+                
+                return response.json()
             
-            if response.status_code != 200:
-                logging.warning(f"API call failed with status code: {response.status_code} for startIndex {params['startIndex']}")
-                logging.warning(f"Response: {response.text}")
+            try:
+                response_data = self._retry_request(
+                    _get_users_page,
+                    context=f"Fetching users page starting at index {start_index}"
+                )
+                
+                items_data = response_data.get('Resources', [])
+                items += items_data
+                
+                total_results = response_data.get('totalResults', 0)
+                logging.info(f"Retrieved {len(items_data)} users from this page. Total collected so far: {len(items)}")
+
+                start_index += count
+                if start_index > total_results:
+                    logging.info(f"Reached end of results. Total users collected: {len(items)}")
+                    break
+                    
+            except requests.exceptions.RequestException as e:
+                logging.warning(f"Failed to fetch page starting at index {start_index}: {e}")
                 logging.warning("Skipping this page and continuing to next page...")
-                params['startIndex'] += params['count']
+                start_index += count
                 continue
-
-            response_data = response.json()
-            items_data = response_data.get('Resources', [])
-            items += items_data
-            
-            total_results = response_data.get('totalResults', 0)
-            logging.info(f"Retrieved {len(items_data)} users from this page. Total collected so far: {len(items)}")
-
-            params['startIndex'] += params['count']
-            if params['startIndex'] > total_results:
-                logging.info(f"Reached end of results. Total users collected: {len(items)}")
-                break
 
         return items
 
-
     def update_user(self, account_id, active=None, role=None):
-        # Update a user's active status or role via SCIM API using PATCH
-        # PATCH is used instead of PUT to preserve existing fields like externalId
-        # Role changes require an admin setting to allow SCIM to modify user roles
-        # `role` can be one of the following: Registered, Moderator, Admin
-        # if another role is passed, it will be ignored (and still report HTTP 200)
-        # `active` can be True or False
-
-        valid_roles = ["Registered", "Moderator", "Admin"]
-
-        scim_url = f"{self.scim_url}/{account_id}"
-        
-        # Build the PATCH payload according to SCIM 2.0 specification
-        operations = []
-        
-        if active is not None:
-            operations.append({
-                "op": "replace",
-                "path": "active",
-                "value": active
-            })
+        """Update a user's active status or role with retry logic"""
+        def _update_user_request():
+            scim_url = f"{self.scim_url}/{account_id}"
             
-        if role is not None:
-            if role in valid_roles:
+            # Build the PATCH payload according to SCIM 2.0 specification
+            operations = []
+            
+            if active is not None:
                 operations.append({
-                    "op": "replace", 
-                    "path": "userType",
-                    "value": role
+                    "op": "replace",
+                    "path": "active",
+                    "value": active
                 })
-            else:
-                print(f"Invalid role: {role}. Valid roles are: {valid_roles}")
-                return
+                
+            if role is not None:
+                if role in self.VALID_ROLES:
+                    operations.append({
+                        "op": "replace", 
+                        "path": "userType",
+                        "value": role
+                    })
+                else:
+                    raise ValueError(f"Invalid role: {role}. Valid roles are: {self.VALID_ROLES}")
 
-        payload = {
-            "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
-            "Operations": operations
-        }
+            payload = {
+                "schemas": ["urn:ietf:params:scim:api:messages:2.0:PatchOp"],
+                "Operations": operations
+            }
 
-        # Add User-Agent to headers
-        headers = self.headers.copy()
-        headers['User-Agent'] = 'so4t_scim_user_deletion/1.0 (http://your-app-url.com; your-contact@email.com)'
-        headers['Content-Type'] = 'application/scim+json'
+            # Add User-Agent to headers
+            headers = self.headers.copy()
+            headers['Content-Type'] = 'application/scim+json'
+            
+            response = self.session.patch(
+                scim_url, 
+                headers=headers, 
+                json=payload, 
+                proxies=self.proxies,
+                verify=self.ssl_verify
+            )
+
+            if response.status_code == 404:
+                logging.warning(f"User with account ID {account_id} not found.")
+                return None
+            elif response.status_code != 200:
+                response.raise_for_status()
+            
+            return response.json()
         
-        response = self.session.patch(scim_url, headers=headers, json=payload, proxies=self.proxies)
+        try:
+            result = self._retry_request(
+                _update_user_request,
+                context=f"Updating user {account_id}"
+            )
+            
+            if result and role is not None:
+                # Verify role update
+                response_json = result
+                try:
+                    user_role = response_json['userType']
+                except KeyError: # If user is not a moderator/admin, the 'userType' key will not exist
+                    user_role = "Registered"
 
-        # If no value is set for `active`, the user account will be deactivated
-
-        scim_user_url = f"{self.scim_url}/{account_id}"
-        payload = {}
-
-        payload['active'] = active
-        if role is not None:
-            if role in self.VALID_ROLES:
-                payload['userType'] = role
-            else:
-                logging.warning(f"Invalid role: {role}. Valid roles are: {self.VALID_ROLES}")
-                return
-
-        response = self.session.put(scim_user_url, headers=self.headers, json=payload, 
-                                proxies=self.proxies, verify=self.ssl_verify)
-
-        if response.status_code == 404:
-            logging.warning(f"User with account ID {account_id} not found.")
-
-        elif response.status_code != 200:
-            logging.error(f"API call failed with status code: {response.status_code}.")
-            logging.error(response.text)
-
-        elif role is not None:
-            response_json = response.json()
-            try:
-                 user_role = response_json['userType']
-            except KeyError: # If user is not a moderator/admin, the 'userType' key will not exist
-                user_role = "Registered"
-
-            if user_role != role:
-                logging.warning(f"Failed to update user with account ID {account_id} to role: "
-                                f"{role}")
-                logging.warning("Please check that SCIM settings in the Stack Overflow admin "
-                              "panel to make sure the ability to change user pemissions is enabled "
-                              "(i.e check the boxes).")
-            else:
-                logging.info(f"Updated user with account ID {account_id} to role: {role}")
-
+                if user_role != role:
+                    logging.warning(f"Failed to update user with account ID {account_id} to role: {role}")
+                    logging.warning("Please check that SCIM settings in the Stack Overflow admin "
+                                  "panel to make sure the ability to change user pemissions is enabled "
+                                  "(i.e check the boxes).")
+                else:
+                    logging.info(f"Updated user with account ID {account_id} to role: {role}")
+            
+            return result
+            
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to update user {account_id} after retries: {e}")
+            return None
 
     def delete_user(self, account_id):
-
-        scim_user_url = f"{self.scim_url}/{account_id}"
+        """Delete a user with comprehensive retry and error handling"""
         deletion_result = {
             'account_id': account_id,
             'account_url': f'{self.base_url}/accounts/{account_id}',
@@ -219,83 +361,77 @@ class ScimClient:
             'message': 'User deleted successfully.'
         }
 
-        logging.info(f"Sending DELETE request to {scim_user_url}")
-        response = self.session.delete(scim_user_url, headers=self.headers, proxies=self.proxies, 
-                                   verify=self.ssl_verify)
-
-        if response.status_code == 400:
-            logging.error(f"Failed to delete user with account ID {account_id}")
-            logging.error(type(response.json().get('ErrorMessage')))
-            logging.error(response.json().get('ErrorMessage'))
-            deletion_result['status'] = 'error'
-            deletion_result['message'] = response.json().get('ErrorMessage')
-            return deletion_result
-
-        elif response.status_code == 404:
-            logging.error(f"Delete request for user with account ID {account_id} returned 404.")
-            logging.error("This could mean that user deletion for SCIM is not enabled for your site "
-                          "or that the user does not exist.")
-            logging.error("To enable user deletion for SCIM, open a support ticket with Stack Overflow.")
-            deletion_result['status'] = 'error'
-            deletion_result['message'] = "User not found."
-            return deletion_result
-
-        elif response.status_code == 500:
-            error_message = response.json().get('ErrorMessage')
-
-            if "Adjust role to User" in error_message:
-                logging.warning(f"User with account ID {account_id} cannot be deleted because they're "
-                                "a moderator or admin.")
-                
-                # logging.warning("Attempting to reduce their role to User...")
-                # self.update_user(account_id, role="Registered")
-                # logging.warning("Retrying delete...")
-                # self.delete_user(account_id)
-                
-
-                @retry(retry=retry_if_exception_type(requests.exceptions.RequestException), 
-                   stop=stop_after_attempt(self.MAX_RETRIES), 
-                   wait=wait_exponential(multiplier=1, min=1, max=10))
-                def delete_user_retry():
-                    logging.warning("Attempting to reduce their role to Registered...")
-                    self.update_user(account_id, role="Registered")
-                    logging.warning("Retrying delete...")
-                    self.delete_user(account_id)
-
-                try:
-                    delete_user_retry()
-                except RetryError:
-                    logging.error("Max retries reached. Aborting deletion.")
-                    deletion_result['status'] = 'error'
-                    deletion_result['message'] = f"Attempted to delete {self.MAX_RETRIES} times. " \
-                                                    "Max retries reached. Deletion aborted."
-                
-                return deletion_result
+        def _delete_user_request():
+            scim_user_url = f"{self.scim_url}/{account_id}"
+            logging.info(f"Sending DELETE request to {scim_user_url}")
             
-            elif "FK_CommunityMemberships_CreationUser" in error_message:
-                logging.warning(f"User with account ID {account_id} cannot be deleted because they are "
-                                "the creator of a community.")
-                logging.warning("Please contact Stack Overflow support for assistance.")
+            response = self.session.delete(
+                scim_user_url, 
+                headers=self.headers, 
+                proxies=self.proxies,
+                verify=self.ssl_verify
+            )
+            
+            # Handle specific error cases that shouldn't be retried
+            if response.status_code == 400:
                 deletion_result['status'] = 'error'
-                deletion_result['message'] = "User cannot be deleted because they are the creator " \
-                                                "of a community. Please contact support."
+                deletion_result['message'] = response.json().get('ErrorMessage', 'Bad request')
                 return deletion_result
+
+            elif response.status_code == 404:
+                logging.error(f"Delete request for user with account ID {account_id} returned 404.")
+                logging.error("This could mean that user deletion for SCIM is not enabled for your site "
+                            "or that the user does not exist.")
+                logging.error("To enable user deletion for SCIM, open a support ticket with Stack Overflow.")
+                deletion_result['status'] = 'error'
+                deletion_result['message'] = "User not found or deletion not enabled for SCIM."
+                return deletion_result
+
+            elif response.status_code == 500:
+                error_message = response.json().get('ErrorMessage', 'Internal server error')
+
+                if "Adjust role to User" in error_message:
+                    logging.warning(f"User with account ID {account_id} cannot be deleted because they're "
+                                    "a moderator or admin.")
+                    logging.warning("Attempting to reduce their role to Registered...")
+                    
+                    # Try to update user role first
+                    update_result = self.update_user(account_id, role="Registered")
+                    if update_result:
+                        logging.warning("Role updated, retrying delete...")
+                        # Retry the delete by raising an exception to trigger retry logic
+                        response.raise_for_status()
+                    else:
+                        deletion_result['status'] = 'error'
+                        deletion_result['message'] = "Failed to update user role before deletion."
+                        return deletion_result
+                
+                elif "FK_CommunityMemberships_CreationUser" in error_message:
+                    deletion_result['status'] = 'error'
+                    deletion_result['message'] = "User cannot be deleted because they are the creator of a community."
+                    return deletion_result
+                else:
+                    # Other 500 errors should be retried
+                    response.raise_for_status()
+
+            elif response.status_code != 204: # any unexpected status code
+                response.raise_for_status()
 
             else:
-                logging.error(f"Failed to delete user with account ID {account_id}")
-                logging.error(error_message)
-                deletion_result['status'] = 'error'
-                deletion_result['message'] = "Failed to delete user. Error message: " \
-                                                f"{error_message}"
+                logging.info(f"Deleted user with account ID {account_id}")
                 return deletion_result
-
-        elif response.status_code != 204: # any unexpected status code or scenario
-            logging.error(f"API call failed with status code: {response.status_code}.")
-            logging.error(response.text)
+        
+        try:
+            return self._retry_request(
+                _delete_user_request,
+                context=f"Deleting user {account_id}"
+            )
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Failed to delete user {account_id} after retries: {e}")
             deletion_result['status'] = 'error'
-            deletion_result['message'] = response.text
+            deletion_result['message'] = f"Failed to delete user after retries: {str(e)}"
             return deletion_result
 
-        else:
-            logging.info(f"Deleted user with account ID {account_id}")
-            return deletion_result
+
+# Set up logging
+logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
