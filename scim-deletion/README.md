@@ -50,7 +50,7 @@ pip install requests  # For the so4t_scim module
 
 ### Basic Syntax
 ```bash
-python bulk_deletion_script.py --token <SCIM_TOKEN> --url <BASE_URL> [OPTIONS]
+python scim_user_deletion.py --token <SCIM_TOKEN> --url <BASE_URL> [OPTIONS]
 ```
 
 ### Required Arguments
@@ -61,21 +61,21 @@ python bulk_deletion_script.py --token <SCIM_TOKEN> --url <BASE_URL> [OPTIONS]
 
 #### 1. Delete Deactivated Users
 ```bash
-python bulk_deletion_script.py --token YOUR_TOKEN --url https://your-team.stackoverflowteams.com --deactivated
+python scim_user_deletion.py --token YOUR_TOKEN --url https://your-site.stackenterprise.co --deactivated
 ```
 
 #### 2. Delete Users from CSV File
 ```bash
-python bulk_deletion_script.py --token YOUR_TOKEN --url https://your-team.stackoverflowteams.com --csv users_to_delete.csv
+python scim_user_deletion.py --token YOUR_TOKEN --url https://your-site.stackenterprise.co --csv users_to_delete.csv
 ```
 
 #### 3. Dry Run Mode (RECOMMENDED FIRST STEP)
 ```bash
 # Test deactivated user deletion
-python bulk_deletion_script.py --token YOUR_TOKEN --url https://your-team.stackoverflowteams.com --deactivated --dry-run
+python scim_user_deletion.py --token YOUR_TOKEN --url https://your-site.stackenterprise.co --deactivated --dry-run
 
 # Test CSV-based deletion
-python bulk_deletion_script.py --token YOUR_TOKEN --url https://your-team.stackoverflowteams.com --csv users_to_delete.csv --dry-run
+python scim_user_deletion.py --token YOUR_TOKEN --url https://your-site.stackenterprise.co --csv users_to_delete.csv --dry-run
 ```
 
 ## Safety Features
@@ -161,7 +161,6 @@ The script includes sophisticated error handling:
 - Monitor for unauthorized usage
 
 ### Data Protection
-- Create backups before bulk operations
 - Test on non-production environments first
 - Document all deletion operations
 - Maintain audit trails

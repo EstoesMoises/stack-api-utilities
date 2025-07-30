@@ -68,7 +68,6 @@ def get_user_confirmation(users_to_delete: List, operation_type: str, dry_run: b
     preview_users_to_delete(users_to_delete, operation_type)
     
     print("⚠️  WARNING: User deletion is IRREVERSIBLE!")
-    print("⚠️  Make sure you have backups and have verified this list!")
     print()
     
     while True:
@@ -100,15 +99,13 @@ def main():
     
     # Create error handler for customization if needed
     error_handler = ErrorHandler()
-    
-    # Client now handles all retry logic internally
+
     client = ScimClient(args.token, args.url, error_handler=error_handler)
 
     # Check for dry-run mode
     if args.dry_run:
         logging.info("🔍 Running in DRY-RUN mode - no actual deletions will be performed")
 
-    # Get all users via SCIM API - retry logic now built into client
     try:
         all_users = client.get_all_users()
         logging.info(f"Successfully retrieved {len(all_users)} users")
@@ -254,7 +251,6 @@ def delete_users_simplified(
                 logging.debug(f"[DRY-RUN] Would successfully delete user at index {index}: {user_identifier}")
         
         else:
-            # Real deletion using client with built-in retry
             try:
                 deletion_result = client.delete_user(user_id)
                 
